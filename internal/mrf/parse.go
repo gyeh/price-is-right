@@ -5,23 +5,40 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	simdjson "github.com/minio/simdjson-go"
 )
+
+// useSimd is true if the CPU supports AVX2+CLMUL for simdjson acceleration.
+var useSimd = simdjson.SupportedCPU()
+
+// ParserName returns which JSON parser is active.
+func ParserName() string {
+	if useSimd {
+		return "simdjson (SIMD-accelerated)"
+	}
+	return "encoding/json (standard)"
+}
 
 // MatchedProviders maps provider_group_id → list of ProviderInfo that matched target NPIs.
 type MatchedProviders struct {
-	// ByGroupID maps provider_group_id to the matched provider details.
 	ByGroupID map[int][]ProviderInfo
 }
 
 // ParseProviderReferences scans provider_references NDJSON files for NPI matches (Phase A).
-// Returns a map of provider_group_id → matched ProviderInfo entries.
 func ParseProviderReferences(files []string, targetNPIs map[int64]struct{}, onRefScanned func()) (*MatchedProviders, error) {
 	matched := &MatchedProviders{
 		ByGroupID: make(map[int][]ProviderInfo),
 	}
 
 	for _, filePath := range files {
-		if err := scanProviderRefFile(filePath, targetNPIs, matched, onRefScanned); err != nil {
+		var err error
+		if useSimd {
+			err = scanProviderRefFileSimd(filePath, targetNPIs, matched, onRefScanned)
+		} else {
+			err = scanProviderRefFileStdlib(filePath, targetNPIs, matched, onRefScanned)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", filePath, err)
 		}
 	}
@@ -29,7 +46,94 @@ func ParseProviderReferences(files []string, targetNPIs map[int64]struct{}, onRe
 	return matched, nil
 }
 
-func scanProviderRefFile(filePath string, targetNPIs map[int64]struct{}, matched *MatchedProviders, onRefScanned func()) error {
+// ParseInNetwork scans in_network NDJSON files and emits RateResults for matching NPIs (Phase B).
+func ParseInNetwork(
+	files []string,
+	targetNPIs map[int64]struct{},
+	matchedProviders *MatchedProviders,
+	sourceFile string,
+	onCodeScanned func(),
+	emit func(RateResult),
+) error {
+	for _, filePath := range files {
+		var err error
+		if useSimd {
+			err = scanInNetworkFileSimd(filePath, targetNPIs, matchedProviders, sourceFile, onCodeScanned, emit)
+		} else {
+			err = scanInNetworkFileStdlib(filePath, targetNPIs, matchedProviders, sourceFile, onCodeScanned, emit)
+		}
+		if err != nil {
+			return fmt.Errorf("parsing %s: %w", filePath, err)
+		}
+	}
+	return nil
+}
+
+// emitInNetworkResults extracts and emits rate results from a parsed InNetworkItem.
+// Shared by both stdlib and simd code paths.
+func emitInNetworkResults(
+	item *InNetworkItem,
+	targetNPIs map[int64]struct{},
+	matchedProviders *MatchedProviders,
+	sourceFile string,
+	emit func(RateResult),
+) {
+	description := item.Name
+	if description == "" {
+		description = item.Description
+	}
+
+	for _, nr := range item.NegotiatedRates {
+		var providers []ProviderInfo
+
+		// Case A: provider_references IDs
+		if matchedProviders != nil {
+			for _, refID := range nr.ProviderReferences {
+				if infos, ok := matchedProviders.ByGroupID[refID]; ok {
+					providers = append(providers, infos...)
+				}
+			}
+		}
+
+		// Case B: inline provider_groups
+		for _, pg := range nr.ProviderGroups {
+			for _, npi := range pg.NPI {
+				if _, ok := targetNPIs[npi]; ok {
+					providers = append(providers, ProviderInfo{NPI: npi, TIN: pg.TIN})
+				}
+			}
+		}
+
+		if len(providers) == 0 {
+			continue
+		}
+
+		for _, prov := range providers {
+			for _, price := range nr.NegotiatedPrices {
+				emit(RateResult{
+					SourceFile:             sourceFile,
+					NPI:                    prov.NPI,
+					TIN:                    prov.TIN,
+					BillingCodeType:        item.BillingCodeType,
+					BillingCode:            item.BillingCode,
+					BillingCodeDescription: description,
+					NegotiationArrangement: item.NegotiationArrangement,
+					NegotiatedRate:         price.NegotiatedRate,
+					NegotiatedType:         price.NegotiatedType,
+					BillingClass:           price.BillingClass,
+					Setting:                price.Setting,
+					ExpirationDate:         price.ExpirationDate,
+					ServiceCode:            price.ServiceCode,
+					BillingCodeModifier:    price.BillingCodeModifier,
+				})
+			}
+		}
+	}
+}
+
+// --- stdlib (encoding/json) implementations ---
+
+func scanProviderRefFileStdlib(filePath string, targetNPIs map[int64]struct{}, matched *MatchedProviders, onRefScanned func()) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -37,7 +141,7 @@ func scanProviderRefFile(filePath string, targetNPIs map[int64]struct{}, matched
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024) // up to 64MB per line
+	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -47,7 +151,7 @@ func scanProviderRefFile(filePath string, targetNPIs map[int64]struct{}, matched
 
 		var ref ProviderReference
 		if err := json.Unmarshal(line, &ref); err != nil {
-			continue // skip malformed lines
+			continue
 		}
 
 		if onRefScanned != nil {
@@ -69,25 +173,7 @@ func scanProviderRefFile(filePath string, targetNPIs map[int64]struct{}, matched
 	return scanner.Err()
 }
 
-// ParseInNetwork scans in_network NDJSON files and emits RateResults for matching NPIs (Phase B).
-// It checks both provider_references (via matchedProviders) and inline provider_groups.
-func ParseInNetwork(
-	files []string,
-	targetNPIs map[int64]struct{},
-	matchedProviders *MatchedProviders,
-	sourceFile string,
-	onCodeScanned func(),
-	emit func(RateResult),
-) error {
-	for _, filePath := range files {
-		if err := scanInNetworkFile(filePath, targetNPIs, matchedProviders, sourceFile, onCodeScanned, emit); err != nil {
-			return fmt.Errorf("parsing %s: %w", filePath, err)
-		}
-	}
-	return nil
-}
-
-func scanInNetworkFile(
+func scanInNetworkFileStdlib(
 	filePath string,
 	targetNPIs map[int64]struct{},
 	matchedProviders *MatchedProviders,
@@ -119,59 +205,7 @@ func scanInNetworkFile(
 			onCodeScanned()
 		}
 
-		description := item.Name
-		if description == "" {
-			description = item.Description
-		}
-
-		for _, nr := range item.NegotiatedRates {
-			// Collect matched providers from both sources
-			var providers []ProviderInfo
-
-			// Case A: provider_references IDs
-			if matchedProviders != nil {
-				for _, refID := range nr.ProviderReferences {
-					if infos, ok := matchedProviders.ByGroupID[refID]; ok {
-						providers = append(providers, infos...)
-					}
-				}
-			}
-
-			// Case B: inline provider_groups
-			for _, pg := range nr.ProviderGroups {
-				for _, npi := range pg.NPI {
-					if _, ok := targetNPIs[npi]; ok {
-						providers = append(providers, ProviderInfo{NPI: npi, TIN: pg.TIN})
-					}
-				}
-			}
-
-			if len(providers) == 0 {
-				continue
-			}
-
-			// Emit one result per provider × price combination
-			for _, prov := range providers {
-				for _, price := range nr.NegotiatedPrices {
-					emit(RateResult{
-						SourceFile:             sourceFile,
-						NPI:                    prov.NPI,
-						TIN:                    prov.TIN,
-						BillingCodeType:        item.BillingCodeType,
-						BillingCode:            item.BillingCode,
-						BillingCodeDescription: description,
-						NegotiationArrangement: item.NegotiationArrangement,
-						NegotiatedRate:         price.NegotiatedRate,
-						NegotiatedType:         price.NegotiatedType,
-						BillingClass:           price.BillingClass,
-						Setting:                price.Setting,
-						ExpirationDate:         price.ExpirationDate,
-						ServiceCode:            price.ServiceCode,
-						BillingCodeModifier:    price.BillingCodeModifier,
-					})
-				}
-			}
-		}
+		emitInNetworkResults(&item, targetNPIs, matchedProviders, sourceFile, emit)
 	}
 
 	return scanner.Err()

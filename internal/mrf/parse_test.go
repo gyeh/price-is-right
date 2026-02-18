@@ -3,6 +3,7 @@ package mrf
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -351,5 +352,127 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if results[0].NPI != 1234567890 {
 		t.Errorf("expected NPI 1234567890, got %d", results[0].NPI)
+	}
+}
+
+func TestParserName(t *testing.T) {
+	name := ParserName()
+	if runtime.GOARCH == "amd64" {
+		// On amd64, simdjson may or may not be available depending on CPU features
+		t.Logf("Parser on amd64: %s (useSimd=%v)", name, useSimd)
+	} else {
+		// On non-amd64 (arm64, etc.), simdjson is never available
+		if useSimd {
+			t.Errorf("useSimd should be false on %s, got true", runtime.GOARCH)
+		}
+		if name != "encoding/json (standard)" {
+			t.Errorf("expected stdlib parser on %s, got %s", runtime.GOARCH, name)
+		}
+		t.Logf("Parser on %s: %s (correctly using stdlib fallback)", runtime.GOARCH, name)
+	}
+}
+
+// TestStdlibProviderRefsDirectly tests the stdlib path explicitly.
+func TestStdlibProviderRefsDirectly(t *testing.T) {
+	dir := t.TempDir()
+	ndjson := `{"provider_group_id":1,"provider_groups":[{"npi":[1234567890],"tin":{"type":"ein","value":"12-3456789"}}]}`
+	f := writeTestFile(t, dir, "provider_references_00.jsonl", ndjson)
+
+	targetNPIs := map[int64]struct{}{1234567890: {}}
+	matched := &MatchedProviders{ByGroupID: make(map[int][]ProviderInfo)}
+
+	err := scanProviderRefFileStdlib(f, targetNPIs, matched, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched.ByGroupID) != 1 {
+		t.Errorf("stdlib: expected 1 matched group, got %d", len(matched.ByGroupID))
+	}
+}
+
+// TestSimdProviderRefsDirectly tests the simdjson path explicitly (skipped if CPU unsupported).
+func TestSimdProviderRefsDirectly(t *testing.T) {
+	if !useSimd {
+		t.Skipf("simdjson not available on %s (requires AVX2+CLMUL)", runtime.GOARCH)
+	}
+
+	dir := t.TempDir()
+	ndjson := `{"provider_group_id":1,"provider_groups":[{"npi":[1234567890],"tin":{"type":"ein","value":"12-3456789"}}]}`
+	f := writeTestFile(t, dir, "provider_references_00.jsonl", ndjson)
+
+	targetNPIs := map[int64]struct{}{1234567890: {}}
+	matched := &MatchedProviders{ByGroupID: make(map[int][]ProviderInfo)}
+
+	err := scanProviderRefFileSimd(f, targetNPIs, matched, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matched.ByGroupID) != 1 {
+		t.Errorf("simd: expected 1 matched group, got %d", len(matched.ByGroupID))
+	}
+	infos := matched.ByGroupID[1]
+	if len(infos) != 1 || infos[0].NPI != 1234567890 {
+		t.Errorf("simd: expected NPI 1234567890, got %v", infos)
+	}
+	if infos[0].TIN.Type != "ein" || infos[0].TIN.Value != "12-3456789" {
+		t.Errorf("simd: expected TIN ein/12-3456789, got %v", infos[0].TIN)
+	}
+}
+
+// TestSimdInNetworkDirectly tests the simdjson in_network path explicitly.
+func TestSimdInNetworkDirectly(t *testing.T) {
+	if !useSimd {
+		t.Skipf("simdjson not available on %s (requires AVX2+CLMUL)", runtime.GOARCH)
+	}
+
+	dir := t.TempDir()
+	ndjson := `{"billing_code_type":"CPT","billing_code":"99213","name":"Office visit","negotiation_arrangement":"ffs","negotiated_rates":[{"provider_references":[1],"negotiated_prices":[{"negotiated_rate":125.50,"negotiated_type":"negotiated","billing_class":"professional","setting":"outpatient","expiration_date":"2025-12-31"}]}]}`
+	f := writeTestFile(t, dir, "in_network_00.jsonl", ndjson)
+
+	targetNPIs := map[int64]struct{}{1234567890: {}}
+	matchedProviders := &MatchedProviders{
+		ByGroupID: map[int][]ProviderInfo{
+			1: {{NPI: 1234567890, TIN: TIN{Type: "ein", Value: "12-3456789"}}},
+		},
+	}
+
+	var results []RateResult
+	err := scanInNetworkFileSimd(f, targetNPIs, matchedProviders, "test", nil,
+		func(r RateResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("simd: expected 1 result, got %d", len(results))
+	}
+	if results[0].NegotiatedRate != 125.50 {
+		t.Errorf("simd: expected rate 125.50, got %f", results[0].NegotiatedRate)
+	}
+}
+
+// TestSimdInNetworkInlineProviderGroups tests simdjson with inline provider_groups.
+func TestSimdInNetworkInlineProviderGroups(t *testing.T) {
+	if !useSimd {
+		t.Skipf("simdjson not available on %s (requires AVX2+CLMUL)", runtime.GOARCH)
+	}
+
+	dir := t.TempDir()
+	ndjson := `{"billing_code_type":"HCPCS","billing_code":"J0129","name":"Injection","negotiation_arrangement":"ffs","negotiated_rates":[{"provider_groups":[{"npi":[1234567890],"tin":{"type":"ein","value":"12-3456789"}}],"negotiated_prices":[{"negotiated_rate":50.00,"negotiated_type":"negotiated","billing_class":"professional","setting":"outpatient","expiration_date":"2025-06-30"}]}]}`
+	f := writeTestFile(t, dir, "in_network_00.jsonl", ndjson)
+
+	targetNPIs := map[int64]struct{}{1234567890: {}}
+	matchedProviders := &MatchedProviders{ByGroupID: map[int][]ProviderInfo{}}
+
+	var results []RateResult
+	err := scanInNetworkFileSimd(f, targetNPIs, matchedProviders, "test", nil,
+		func(r RateResult) { results = append(results, r) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("simd: expected 1 result, got %d", len(results))
+	}
+	if results[0].BillingCode != "J0129" {
+		t.Errorf("simd: expected J0129, got %s", results[0].BillingCode)
 	}
 }

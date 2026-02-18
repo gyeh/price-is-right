@@ -98,6 +98,10 @@ func newSearchCmd() *cobra.Command {
 				cancel()
 			}()
 
+			// Log parser info
+			fmt.Fprintf(os.Stderr, "Parser: %s\n", mrf.ParserName())
+			fmt.Fprintf(os.Stderr, "Searching %d files for %d NPIs with %d workers\n\n", len(urls), len(npis), workers)
+
 			// Run the worker pool
 			startTime := time.Now()
 
