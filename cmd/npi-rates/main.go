@@ -14,6 +14,7 @@ import (
 
 	"github.com/gyeh/npi-rates/internal/cloud"
 	"github.com/gyeh/npi-rates/internal/mrf"
+	"github.com/gyeh/npi-rates/internal/npi"
 	"github.com/gyeh/npi-rates/internal/output"
 	"github.com/gyeh/npi-rates/internal/progress"
 	"github.com/gyeh/npi-rates/internal/worker"
@@ -36,12 +37,14 @@ func main() {
 
 func newSearchCmd() *cobra.Command {
 	var (
-		urlsFile   string
-		npiList    string
-		outputFile string
-		workers    int
-		tmpDir     string
-		noProgress bool
+		urlsFile     string
+		npiList      string
+		providerName string
+		state        string
+		outputFile   string
+		workers      int
+		tmpDir       string
+		noProgress   bool
 
 		// Cloud mode flags (orchestrator)
 		cloudMode   bool
@@ -60,13 +63,23 @@ func newSearchCmd() *cobra.Command {
 		Use:   "search",
 		Short: "Search MRF files for negotiated rates matching specified NPIs",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Parse NPIs
-			npis, err := parseNPIs(npiList)
-			if err != nil {
-				return fmt.Errorf("parsing NPIs: %w", err)
+			// Resolve NPIs — either from --npi or --provider-name
+			var npis []int64
+			if providerName != "" {
+				selected, err := searchAndSelectProvider(providerName, state)
+				if err != nil {
+					return err
+				}
+				npis = []int64{selected.NPI}
+			} else if npiList != "" {
+				var err error
+				npis, err = parseNPIs(npiList)
+				if err != nil {
+					return fmt.Errorf("parsing NPIs: %w", err)
+				}
 			}
 			if len(npis) == 0 {
-				return fmt.Errorf("no NPIs specified")
+				return fmt.Errorf("specify either --npi or --provider-name")
 			}
 
 			// Handle signals
@@ -79,6 +92,15 @@ func newSearchCmd() *cobra.Command {
 				fmt.Fprintln(os.Stderr, "\nInterrupted, cleaning up...")
 				cancel()
 			}()
+
+			// Look up NPI provider info (skip in worker mode — no user to display to)
+			if urlsS3 == "" {
+				if notFound := printProviderInfo(ctx, npis); len(notFound) > 0 {
+					if !confirmContinue(notFound) {
+						return fmt.Errorf("aborted: %d NPI(s) not found in NPPES registry", len(notFound))
+					}
+				}
+			}
 
 			// --- Cloud mode: distribute to Fargate ---
 			if cloudMode {
@@ -135,9 +157,10 @@ func newSearchCmd() *cobra.Command {
 					urls = append(urls, line)
 				}
 			} else if urlsFile != "" {
-				urls, err = readURLs(urlsFile)
-				if err != nil {
-					return fmt.Errorf("reading URLs: %w", err)
+				var readErr error
+				urls, readErr = readURLs(urlsFile)
+				if readErr != nil {
+					return fmt.Errorf("reading URLs: %w", readErr)
 				}
 			} else {
 				return fmt.Errorf("either --urls-file or --urls-s3 is required")
@@ -253,12 +276,12 @@ func newSearchCmd() *cobra.Command {
 	// Standard flags
 	cmd.Flags().StringVar(&urlsFile, "urls-file", "", "File containing MRF URLs (one per line)")
 	cmd.Flags().StringVar(&npiList, "npi", "", "Comma-separated NPI numbers to search for")
+	cmd.Flags().StringVar(&providerName, "provider-name", "", "Search by provider name (\"First Last\")")
+	cmd.Flags().StringVar(&state, "state", "", "State filter for provider name search (2-letter code, e.g. NY)")
 	cmd.Flags().StringVarP(&outputFile, "output", "o", "results.json", "Output file path (use '-' for stdout)")
 	cmd.Flags().IntVar(&workers, "workers", 3, "Number of concurrent file workers")
 	cmd.Flags().StringVar(&tmpDir, "tmp-dir", "", "Temp directory for intermediate files (default: system temp)")
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress bars")
-
-	cmd.MarkFlagRequired("npi")
 
 	// Cloud mode flags (orchestrator)
 	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Fargate)")
@@ -320,6 +343,135 @@ func newCloudSetupCmd() *cobra.Command {
 	cmd.MarkFlagRequired("s3-bucket")
 
 	return cmd
+}
+
+// printProviderInfo looks up and displays provider details for each NPI.
+// Returns the list of NPI numbers that were not found in the NPPES registry.
+func printProviderInfo(ctx context.Context, npis []int64) []int64 {
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer lookupCancel()
+
+	results, errs := npi.LookupAll(lookupCtx, npis)
+
+	var notFound []int64
+	for i, info := range results {
+		if errs[i] != nil {
+			fmt.Fprintf(os.Stderr, "NPI %d: lookup failed (%v)\n", npis[i], errs[i])
+			continue
+		}
+		if info == nil {
+			fmt.Fprintf(os.Stderr, "NPI %d: not found in NPPES registry\n", npis[i])
+			notFound = append(notFound, npis[i])
+			continue
+		}
+
+		// Build display line
+		fmt.Fprintf(os.Stderr, "NPI %d: %s", info.NPI, info.Name)
+		if info.Credential != "" {
+			fmt.Fprintf(os.Stderr, ", %s", info.Credential)
+		}
+		fmt.Fprintln(os.Stderr)
+
+		if info.PrimaryTaxonomy != "" {
+			fmt.Fprintf(os.Stderr, "  Specialty: %s\n", info.PrimaryTaxonomy)
+		}
+		if info.PracticeAddress != "" {
+			line := "  Location:  " + info.PracticeAddress
+			if info.PracticePhone != "" {
+				line += "  |  " + info.PracticePhone
+			}
+			fmt.Fprintln(os.Stderr, line)
+		}
+		if info.Status != "A" {
+			fmt.Fprintf(os.Stderr, "  WARNING:   NPI status is %q (not active)\n", info.Status)
+		}
+	}
+	fmt.Fprintln(os.Stderr)
+	return notFound
+}
+
+// confirmContinue prompts the user to continue despite not-found NPIs.
+// Returns true if the user wants to continue, false to abort.
+func confirmContinue(notFound []int64) bool {
+	npiStrs := make([]string, len(notFound))
+	for i, n := range notFound {
+		npiStrs[i] = fmt.Sprintf("%d", n)
+	}
+	fmt.Fprintf(os.Stderr, "NPI(s) %s not found. Continue anyway? [y/N]: ", strings.Join(npiStrs, ", "))
+
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return false
+	}
+	answer := strings.TrimSpace(strings.ToLower(scanner.Text()))
+	return answer == "y" || answer == "yes"
+}
+
+// searchAndSelectProvider queries the NPPES registry by name and prompts the user
+// to select a single provider from the results.
+func searchAndSelectProvider(name, state string) (*npi.ProviderInfo, error) {
+	// Split "First Last" — first token is first name, rest is last name
+	parts := strings.Fields(name)
+	if len(parts) < 2 {
+		return nil, fmt.Errorf("--provider-name requires first and last name (e.g. \"John Smith\")")
+	}
+	firstName := parts[0]
+	lastName := strings.Join(parts[1:], " ")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	fmt.Fprintf(os.Stderr, "Searching NPPES registry for \"%s %s\"", firstName, lastName)
+	if state != "" {
+		fmt.Fprintf(os.Stderr, " in %s", strings.ToUpper(state))
+	}
+	fmt.Fprintln(os.Stderr, "...")
+
+	providers, err := npi.SearchByName(ctx, firstName, lastName, strings.ToUpper(state))
+	if err != nil {
+		return nil, fmt.Errorf("searching NPI registry: %w", err)
+	}
+	if len(providers) == 0 {
+		return nil, fmt.Errorf("no providers found matching \"%s\"", name)
+	}
+
+	// Display results
+	fmt.Fprintf(os.Stderr, "\nFound %d provider(s):\n\n", len(providers))
+	for i, p := range providers {
+		fmt.Fprintf(os.Stderr, "  [%d] %s (NPI %d)", i+1, p.Name, p.NPI)
+		if p.Credential != "" {
+			fmt.Fprintf(os.Stderr, ", %s", p.Credential)
+		}
+		fmt.Fprintln(os.Stderr)
+		if p.PrimaryTaxonomy != "" {
+			fmt.Fprintf(os.Stderr, "      Specialty: %s\n", p.PrimaryTaxonomy)
+		}
+		if p.PracticeAddress != "" {
+			fmt.Fprintf(os.Stderr, "      Location:  %s\n", p.PracticeAddress)
+		}
+	}
+
+	// Single result — auto-select
+	if len(providers) == 1 {
+		fmt.Fprintf(os.Stderr, "\nAuto-selected the only match: NPI %d\n\n", providers[0].NPI)
+		return providers[0], nil
+	}
+
+	// Prompt for selection
+	fmt.Fprintf(os.Stderr, "\nSelect a provider [1-%d]: ", len(providers))
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return nil, fmt.Errorf("no input received")
+	}
+	input := strings.TrimSpace(scanner.Text())
+	choice, err := strconv.Atoi(input)
+	if err != nil || choice < 1 || choice > len(providers) {
+		return nil, fmt.Errorf("invalid selection %q — enter a number between 1 and %d", input, len(providers))
+	}
+
+	selected := providers[choice-1]
+	fmt.Fprintf(os.Stderr, "\nSelected: %s (NPI %d)\n\n", selected.Name, selected.NPI)
+	return selected, nil
 }
 
 func readURLs(path string) ([]string, error) {

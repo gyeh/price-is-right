@@ -160,10 +160,10 @@ func registerTaskDefinition(ctx context.Context, cfg aws.Config, region string) 
 		Family:                  aws.String(taskFamily),
 		RequiresCompatibilities: []ecstypes.Compatibility{ecstypes.CompatibilityFargate},
 		NetworkMode:             ecstypes.NetworkModeAwsvpc,
-		Cpu:                     aws.String("4096"),  // 4 vCPU
-		Memory:                  aws.String("8192"),  // 8 GB
+		Cpu:                     aws.String("8192"),  // 8 vCPU — speeds up pgzip decompression
+		Memory:                  aws.String("16384"), // 16 GB (minimum for 8 vCPU)
 		EphemeralStorage: &ecstypes.EphemeralStorage{
-			SizeInGiB: 100,
+			SizeInGiB: 200, // max Fargate ephemeral — supports decompressed files up to ~190GB
 		},
 		TaskRoleArn:      aws.String("npi-rates-task-role"),
 		ExecutionRoleArn: aws.String("ecsTaskExecutionRole"),

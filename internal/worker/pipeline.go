@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/gyeh/npi-rates/internal/mrf"
 	"github.com/gyeh/npi-rates/internal/progress"
@@ -19,6 +22,11 @@ type PipelineResult struct {
 }
 
 // RunPipeline processes a single MRF URL: download → split → parse → cleanup.
+//
+// Decompression streams directly into jsplit via a FIFO (named pipe), so the full
+// decompressed JSON never exists on disk. Peak disk usage = NDJSON output only,
+// roughly equal to the decompressed size. This is critical for large files (50GB+
+// compressed) where the decompressed data can exceed available storage.
 func RunPipeline(
 	ctx context.Context,
 	url string,
@@ -36,7 +44,55 @@ func RunPipeline(
 	}
 	defer os.RemoveAll(splitDir)
 
-	// Step 1: Download and decompress
+	// Create a FIFO for streaming decompression directly into jsplit.
+	// This eliminates the intermediate decompressed file, halving peak disk usage.
+	fifoPath := filepath.Join(tmpDir, fmt.Sprintf("stream-%d-%d.fifo", os.Getpid(), time.Now().UnixNano()))
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		// FIFO not supported — fall back to file-based pipeline
+		return runPipelineWithFile(ctx, url, targetNPIs, tmpDir, splitDir, tracker)
+	}
+	defer os.Remove(fifoPath)
+
+	// Start download + decompress to FIFO in background goroutine.
+	// The goroutine blocks on os.OpenFile until jsplit opens the FIFO for reading.
+	tracker.SetStage("Downloading + Splitting")
+	dlErrCh := make(chan error, 1)
+	go func() {
+		dlErrCh <- StreamDecompressToPath(ctx, url, fifoPath, func(downloaded, total int64) {
+			tracker.SetProgress(downloaded, total)
+		})
+	}()
+
+	// Split JSON into NDJSON — reads from the FIFO as jsplit's input.
+	// This call blocks until all data is read (download complete + EOF).
+	splitResult, err := mrf.SplitFile(fifoPath, splitDir)
+	if err != nil {
+		result.Err = fmt.Errorf("split: %w", err)
+		return result
+	}
+
+	// Wait for the download goroutine to finish (should already be done when jsplit returns)
+	if dlErr := <-dlErrCh; dlErr != nil {
+		result.Err = fmt.Errorf("download: %w", dlErr)
+		return result
+	}
+
+	// Parse phases A & B
+	return runParsePhases(ctx, result, splitResult, targetNPIs, url, tracker)
+}
+
+// runPipelineWithFile is the fallback pipeline that writes the decompressed file to disk
+// before splitting. Used when FIFOs are not available.
+func runPipelineWithFile(
+	ctx context.Context,
+	url string,
+	targetNPIs map[int64]struct{},
+	tmpDir string,
+	splitDir string,
+	tracker progress.Tracker,
+) *PipelineResult {
+	result := &PipelineResult{URL: url}
+
 	tracker.SetStage("Downloading")
 	dlResult, err := DownloadAndDecompress(ctx, url, tmpDir, func(downloaded, total int64) {
 		tracker.SetProgress(downloaded, total)
@@ -47,7 +103,6 @@ func RunPipeline(
 	}
 	defer os.Remove(dlResult.FilePath)
 
-	// Step 2: Split JSON into NDJSON
 	tracker.SetStage("Splitting")
 	splitResult, err := mrf.SplitFile(dlResult.FilePath, splitDir)
 	if err != nil {
@@ -55,10 +110,22 @@ func RunPipeline(
 		return result
 	}
 
-	// Remove the decompressed JSON file immediately after splitting to save disk
+	// Remove decompressed file immediately to free disk
 	os.Remove(dlResult.FilePath)
 
-	// Step 3: Phase A — Parse provider references
+	return runParsePhases(ctx, result, splitResult, targetNPIs, url, tracker)
+}
+
+// runParsePhases runs Phase A (provider_references) and Phase B (in_network) parsing.
+func runParsePhases(
+	ctx context.Context,
+	result *PipelineResult,
+	splitResult *mrf.SplitResult,
+	targetNPIs map[int64]struct{},
+	url string,
+	tracker progress.Tracker,
+) *PipelineResult {
+	// Phase A — Parse provider references
 	tracker.SetStage("Parsing: provider_references")
 	var refsScanned int64
 	matchedProviders, err := mrf.ParseProviderReferences(
@@ -74,8 +141,6 @@ func RunPipeline(
 		return result
 	}
 
-	// Early termination: if no NPI matches in provider_references AND no in_network
-	// files to check for inline provider_groups, we're done
 	hasRefMatches := len(matchedProviders.ByGroupID) > 0
 	tracker.SetCounter("npi_matches", int64(len(matchedProviders.ByGroupID)))
 
@@ -84,7 +149,7 @@ func RunPipeline(
 		return result
 	}
 
-	// Step 4: Phase B — Parse in_network rates
+	// Phase B — Parse in_network rates
 	tracker.SetStage("Parsing: in_network")
 	var codesScanned int64
 	var mu sync.Mutex
