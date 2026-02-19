@@ -203,8 +203,13 @@ func runPipelineWithFile(
 	}
 	defer os.Remove(dlResult.FilePath)
 
+	// Get decompressed file size for split progress tracking
+	inputSize := fileSize(dlResult.FilePath)
+
 	tracker.SetStage("Splitting")
+	stopProgress := pollSplitProgress(splitDir, inputSize, tracker)
 	splitResult, err := mrf.SplitFile(dlResult.FilePath, splitDir)
+	stopProgress()
 	if err != nil {
 		result.Err = fmt.Errorf("split: %w", err)
 		return result
@@ -307,6 +312,51 @@ func availableSpace(path string) uint64 {
 		return 0
 	}
 	return stat.Bavail * uint64(stat.Bsize)
+}
+
+// fileSize returns the size of a file in bytes, or 0 on error.
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
+// dirSize returns the total size of all files in a directory.
+func dirSize(path string) int64 {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return 0
+	}
+	var total int64
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// pollSplitProgress starts a goroutine that periodically checks the split output
+// directory size and reports progress relative to the expected total.
+// Returns a stop function that must be called when splitting is done.
+func pollSplitProgress(splitDir string, expectedTotal int64, tracker progress.Tracker) func() {
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				written := dirSize(splitDir)
+				tracker.SetProgress(written, expectedTotal)
+			case <-done:
+				return
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 func humanBytesWorker(b uint64) string {
