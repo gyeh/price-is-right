@@ -37,7 +37,7 @@ func main() {
 
 func newSearchCmd() *cobra.Command {
 	var (
-		urlsFile     string
+		urlsFile     string // Used during Cloud mode or local mode
 		npiList      string
 		providerName string
 		state        string
@@ -157,6 +157,7 @@ func newSearchCmd() *cobra.Command {
 					urls = append(urls, line)
 				}
 			} else if urlsFile != "" {
+				// Local mode or Cloud orchestration mode
 				var readErr error
 				urls, readErr = readURLs(urlsFile)
 				if readErr != nil {

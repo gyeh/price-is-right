@@ -27,13 +27,17 @@ func (p *Pool) Run(ctx context.Context, urls []string) []PipelineResult {
 		go func(idx int, u string) {
 			defer wg.Done()
 
-			// Acquire semaphore
+			// Acquire a semaphore slot to limit concurrency to p.Workers.
+			// If all slots are taken, this blocks until one frees up.
 			select {
 			case sem <- struct{}{}:
+				// Slot acquired — proceed with pipeline.
 			case <-ctx.Done():
+				// Context cancelled while waiting — bail out early.
 				results[idx] = PipelineResult{URL: u, Err: ctx.Err()}
 				return
 			}
+			// Release the semaphore slot when this goroutine finishes.
 			defer func() { <-sem }()
 
 			tracker := p.Progress.NewTracker(idx, len(urls), FileNameFromURL(u))
