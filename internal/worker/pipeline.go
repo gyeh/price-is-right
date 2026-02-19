@@ -2,9 +2,11 @@ package worker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -81,9 +83,18 @@ func RunPipeline(
 			return result // context cancelled, don't retry
 		}
 
+		// Don't retry on disk-full — retrying won't help
+		if isDiskFullError(lastErr) {
+			avail := availableSpace(tmpDir)
+			result.Err = fmt.Errorf("%w (available: %s in %s — use --tmp-dir for a larger volume or --workers 1 to reduce concurrent usage)",
+				lastErr, humanBytesWorker(avail), tmpDir)
+			return result
+		}
+
 		if attempt < maxPipelineRetries {
+			tracker.LogWarning(fmt.Sprintf("Attempt %d/%d failed: %v", attempt, maxPipelineRetries, lastErr))
 			delay := time.Duration(attempt) * 2 * time.Second
-			tracker.SetStage(fmt.Sprintf("Retry %d/%d (in %s)", attempt, maxPipelineRetries-1, delay))
+			tracker.SetStage(fmt.Sprintf("Retry %d/%d (waiting %s)", attempt+1, maxPipelineRetries, delay))
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -121,13 +132,45 @@ func runPipelineWithFIFO(
 		})
 	}()
 
-	splitResult, err := mrf.SplitFile(fifoPath, splitDir)
+	// Run jsplit in a goroutine so we can handle context cancellation.
+	// Without this, jsplit blocks on os.Open(fifoPath) if the download goroutine
+	// fails before opening the write end (e.g. on ^C), causing a permanent deadlock.
+	type splitOut struct {
+		result *mrf.SplitResult
+		err    error
+	}
+	splitCh := make(chan splitOut, 1)
+	go func() {
+		r, e := mrf.SplitFile(fifoPath, splitDir)
+		splitCh <- splitOut{r, e}
+	}()
+
+	// Wait for jsplit OR context cancellation
+	var splitResult *mrf.SplitResult
+	var splitErr error
+
+	select {
+	case out := <-splitCh:
+		splitResult = out.result
+		splitErr = out.err
+	case <-ctx.Done():
+		// Unblock jsplit by opening the write end of the FIFO briefly.
+		// jsplit is blocked on os.Open(fifoPath) waiting for a writer — this
+		// connection lets it proceed, read EOF, and return.
+		if f, openErr := os.OpenFile(fifoPath, os.O_WRONLY, 0); openErr == nil {
+			f.Close()
+		}
+		<-splitCh // wait for jsplit to finish
+		<-dlErrCh // drain download goroutine
+		result.Err = ctx.Err()
+		return result
+	}
 
 	// Always drain the download goroutine
 	dlErr := <-dlErrCh
 
-	if err != nil {
-		result.Err = fmt.Errorf("split: %w", err)
+	if splitErr != nil {
+		result.Err = fmt.Errorf("split: %w", splitErr)
 		return result
 	}
 	if dlErr != nil {
@@ -239,4 +282,47 @@ func runParsePhases(
 	}
 
 	return result
+}
+
+// isDiskFullError checks if the error chain contains a "no space left on device" error.
+func isDiskFullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for ENOSPC in error chain
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		if errors.Is(pathErr.Err, syscall.ENOSPC) {
+			return true
+		}
+	}
+	// Also check the error string for wrapped/nested cases (e.g. jsplit)
+	return strings.Contains(err.Error(), "no space left on device")
+}
+
+// availableSpace returns the available bytes on the filesystem containing path.
+func availableSpace(path string) uint64 {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0
+	}
+	return stat.Bavail * uint64(stat.Bsize)
+}
+
+func humanBytesWorker(b uint64) string {
+	const (
+		kb uint64 = 1024
+		mb        = 1024 * kb
+		gb        = 1024 * mb
+	)
+	switch {
+	case b >= gb:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
+	case b >= mb:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(mb))
+	case b >= kb:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(kb))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }

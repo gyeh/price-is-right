@@ -82,15 +82,19 @@ func newSearchCmd() *cobra.Command {
 				return fmt.Errorf("specify either --npi or --provider-name")
 			}
 
-			// Handle signals
+			// Handle signals: first ^C cancels context for graceful shutdown,
+			// second ^C force-exits immediately.
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			sigCh := make(chan os.Signal, 1)
+			sigCh := make(chan os.Signal, 2)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			go func() {
 				<-sigCh
-				fmt.Fprintln(os.Stderr, "\nInterrupted, cleaning up...")
+				fmt.Fprintln(os.Stderr, "\nInterrupted, cleaning up... (^C again to force quit)")
 				cancel()
+				<-sigCh
+				fmt.Fprintln(os.Stderr, "\nForce quit.")
+				os.Exit(1)
 			}()
 
 			// Look up NPI provider info (skip in worker mode — no user to display to)
@@ -184,6 +188,14 @@ func newSearchCmd() *cobra.Command {
 				return fmt.Errorf("creating temp dir: %w", err)
 			}
 
+			// Check available disk space and warn if low
+			avail := availableDiskSpace(tmpDir)
+			if avail > 0 && avail < 50*1024*1024*1024 { // < 50 GB
+				fmt.Fprintf(os.Stderr, "WARNING: Only %s available in temp dir %s\n", humanBytesCLI(avail), tmpDir)
+				fmt.Fprintf(os.Stderr, "  MRF files decompress to 5-40 GB each. Use --tmp-dir to point to a larger volume.\n")
+				fmt.Fprintf(os.Stderr, "  Consider --workers 1 to reduce concurrent disk usage.\n\n")
+			}
+
 			// Set up progress
 			var mgr progress.Manager
 			if noProgress {
@@ -194,6 +206,7 @@ func newSearchCmd() *cobra.Command {
 
 			// Log parser info
 			fmt.Fprintf(os.Stderr, "Parser: %s\n", mrf.ParserName())
+			fmt.Fprintf(os.Stderr, "Temp dir: %s (%s available)\n", tmpDir, humanBytesCLI(avail))
 			fmt.Fprintf(os.Stderr, "Searching %d files for %d NPIs with %d workers\n\n", len(urls), len(npis), workers)
 
 			// Run the worker pool
@@ -493,4 +506,35 @@ func readURLs(path string) ([]string, error) {
 		urls = append(urls, line)
 	}
 	return urls, scanner.Err()
+}
+
+// availableDiskSpace returns the available bytes on the filesystem containing path.
+// Returns 0 if the check fails.
+func availableDiskSpace(path string) uint64 {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(path, &stat); err != nil {
+		return 0
+	}
+	return stat.Bavail * uint64(stat.Bsize)
+}
+
+func humanBytesCLI(b uint64) string {
+	const (
+		kb = 1024
+		mb = 1024 * kb
+		gb = 1024 * mb
+		tb = 1024 * gb
+	)
+	switch {
+	case b >= tb:
+		return fmt.Sprintf("%.1f TB", float64(b)/float64(tb))
+	case b >= gb:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
+	case b >= mb:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(mb))
+	case b >= kb:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(kb))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }
