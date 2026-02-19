@@ -2,9 +2,11 @@ package mrf
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	simdjson "github.com/minio/simdjson-go"
 )
@@ -22,21 +24,42 @@ func ParserName() string {
 
 // MatchedProviders maps provider_group_id → list of ProviderInfo that matched target NPIs.
 type MatchedProviders struct {
-	ByGroupID map[int][]ProviderInfo
+	ByGroupID map[float64][]ProviderInfo
+}
+
+// npiBytePatterns builds byte patterns for pre-filtering raw JSON lines.
+func npiBytePatterns(targetNPIs map[int64]struct{}) [][]byte {
+	patterns := make([][]byte, 0, len(targetNPIs))
+	for npi := range targetNPIs {
+		patterns = append(patterns, []byte(strconv.FormatInt(npi, 10)))
+	}
+	return patterns
+}
+
+// lineContainsAny returns true if the line contains any of the byte patterns.
+func lineContainsAny(line []byte, patterns [][]byte) bool {
+	for _, p := range patterns {
+		if bytes.Contains(line, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseProviderReferences scans provider_references NDJSON files for NPI matches (Phase A).
 func ParseProviderReferences(files []string, targetNPIs map[int64]struct{}, onRefScanned func()) (*MatchedProviders, error) {
 	matched := &MatchedProviders{
-		ByGroupID: make(map[int][]ProviderInfo),
+		ByGroupID: make(map[float64][]ProviderInfo),
 	}
+
+	patterns := npiBytePatterns(targetNPIs)
 
 	for _, filePath := range files {
 		var err error
 		if useSimd {
-			err = scanProviderRefFileSimd(filePath, targetNPIs, matched, onRefScanned)
+			err = scanProviderRefFileSimd(filePath, targetNPIs, patterns, matched, onRefScanned)
 		} else {
-			err = scanProviderRefFileStdlib(filePath, targetNPIs, matched, onRefScanned)
+			err = scanProviderRefFileStdlib(filePath, targetNPIs, patterns, matched, onRefScanned)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", filePath, err)
@@ -133,7 +156,7 @@ func emitInNetworkResults(
 
 // --- stdlib (encoding/json) implementations ---
 
-func scanProviderRefFileStdlib(filePath string, targetNPIs map[int64]struct{}, matched *MatchedProviders, onRefScanned func()) error {
+func scanProviderRefFileStdlib(filePath string, targetNPIs map[int64]struct{}, npiPatterns [][]byte, matched *MatchedProviders, onRefScanned func()) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -149,13 +172,19 @@ func scanProviderRefFileStdlib(filePath string, targetNPIs map[int64]struct{}, m
 			continue
 		}
 
-		var ref ProviderReference
-		if err := json.Unmarshal(line, &ref); err != nil {
+		if onRefScanned != nil {
+			onRefScanned()
+		}
+
+		// Pre-filter: skip lines that don't contain any target NPI as a substring.
+		// This avoids expensive json.Unmarshal on 99.99%+ of lines.
+		if !lineContainsAny(line, npiPatterns) {
 			continue
 		}
 
-		if onRefScanned != nil {
-			onRefScanned()
+		var ref ProviderReference
+		if err := json.Unmarshal(line, &ref); err != nil {
+			continue
 		}
 
 		for _, pg := range ref.ProviderGroups {

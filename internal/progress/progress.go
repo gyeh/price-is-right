@@ -39,23 +39,26 @@ func NewMPBManager() *MPBManager {
 
 // NewTracker creates a new progress tracker for a file.
 func (m *MPBManager) NewTracker(index, total int, filename string) Tracker {
+	stageVal := &atomic.Value{}
+	stageVal.Store("")
 	bar := m.container.AddBar(100,
 		mpb.PrependDecorators(
 			decor.Name(fmt.Sprintf("[%d/%d] %s ", index+1, total, filename), decor.WCSyncSpaceR),
 		),
 		mpb.AppendDecorators(
 			decor.Any(func(s decor.Statistics) string {
-				return "" // stage shown via name update
+				return stageVal.Load().(string)
 			}),
 		),
 	)
 
 	return &mpbTracker{
-		bar:   bar,
-		index: index,
-		total: total,
-		name:  filename,
-		mgr:   m,
+		bar:      bar,
+		index:    index,
+		total:    total,
+		name:     filename,
+		stagePtr: stageVal,
+		mgr:      m,
 	}
 }
 
@@ -70,23 +73,17 @@ func (m *MPBManager) SetOverallStats(filesComplete, filesMatched int, totalRates
 }
 
 type mpbTracker struct {
-	bar   *mpb.Bar
-	index int
-	total int
-	name  string
-	stage string
-	mgr   *MPBManager
+	bar      *mpb.Bar
+	index    int
+	total    int
+	name     string
+	stagePtr *atomic.Value
+	mgr      *MPBManager
 }
 
 func (t *mpbTracker) SetStage(stage string) {
-	t.stage = stage
+	t.stagePtr.Store(stage)
 	t.bar.SetCurrent(0) // reset progress for new stage
-	// Update the bar name to include stage
-	prefix := fmt.Sprintf("[%d/%d] %s  %s", t.index+1, t.total, t.name, stage)
-	t.bar.SetPriority(t.index)
-
-	// We use the bar's decorators approach; for simplicity, just let it show current state
-	_ = prefix
 }
 
 func (t *mpbTracker) SetProgress(current, total int64) {

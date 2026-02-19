@@ -21,12 +21,18 @@ type PipelineResult struct {
 	Err     error
 }
 
+const maxPipelineRetries = 3
+
 // RunPipeline processes a single MRF URL: download → split → parse → cleanup.
 //
 // Decompression streams directly into jsplit via a FIFO (named pipe), so the full
 // decompressed JSON never exists on disk. Peak disk usage = NDJSON output only,
 // roughly equal to the decompressed size. This is critical for large files (50GB+
 // compressed) where the decompressed data can exceed available storage.
+//
+// On failure (e.g. CDN throttling truncating the stream), the pipeline retries up to
+// 3 times. The final attempt falls back to a file-based pipeline that downloads the
+// full file to disk before splitting, which is more resilient to stream interruptions.
 func RunPipeline(
 	ctx context.Context,
 	url string,
@@ -34,27 +40,79 @@ func RunPipeline(
 	tmpDir string,
 	tracker progress.Tracker,
 ) *PipelineResult {
+	// Check if FIFOs are supported (they aren't on all platforms)
+	testFifo := filepath.Join(tmpDir, fmt.Sprintf("fifo-probe-%d.fifo", os.Getpid()))
+	fifoSupported := syscall.Mkfifo(testFifo, 0o600) == nil
+	os.Remove(testFifo)
+
+	var lastErr error
+	for attempt := 1; attempt <= maxPipelineRetries; attempt++ {
+		if ctx.Err() != nil {
+			return &PipelineResult{URL: url, Err: ctx.Err()}
+		}
+
+		// Final attempt or no FIFO support: use file-based pipeline (more resilient)
+		useFile := !fifoSupported || attempt == maxPipelineRetries
+
+		splitDir, err := os.MkdirTemp(tmpDir, "split-*")
+		if err != nil {
+			return &PipelineResult{URL: url, Err: fmt.Errorf("creating split dir: %w", err)}
+		}
+
+		var result *PipelineResult
+		if useFile {
+			result = runPipelineWithFile(ctx, url, targetNPIs, tmpDir, splitDir, tracker)
+		} else {
+			result = runPipelineWithFIFO(ctx, url, targetNPIs, tmpDir, splitDir, tracker)
+		}
+
+		if result.Err == nil {
+			// Success — splitDir cleanup is handled by the caller via defer in the sub-functions,
+			// but we need to ensure it's cleaned up here since we created it.
+			os.RemoveAll(splitDir)
+			return result
+		}
+
+		// Clean up failed attempt
+		os.RemoveAll(splitDir)
+		lastErr = result.Err
+
+		if ctx.Err() != nil {
+			return result // context cancelled, don't retry
+		}
+
+		if attempt < maxPipelineRetries {
+			delay := time.Duration(attempt) * 2 * time.Second
+			tracker.SetStage(fmt.Sprintf("Retry %d/%d (in %s)", attempt, maxPipelineRetries-1, delay))
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return &PipelineResult{URL: url, Err: ctx.Err()}
+			}
+		}
+	}
+
+	return &PipelineResult{URL: url, Err: lastErr}
+}
+
+// runPipelineWithFIFO streams decompressed data through a FIFO into jsplit.
+func runPipelineWithFIFO(
+	ctx context.Context,
+	url string,
+	targetNPIs map[int64]struct{},
+	tmpDir string,
+	splitDir string,
+	tracker progress.Tracker,
+) *PipelineResult {
 	result := &PipelineResult{URL: url}
 
-	// Create a temp directory for this file's split output
-	splitDir, err := os.MkdirTemp(tmpDir, "split-*")
-	if err != nil {
-		result.Err = fmt.Errorf("creating split dir: %w", err)
-		return result
-	}
-	defer os.RemoveAll(splitDir)
-
-	// Create a FIFO for streaming decompression directly into jsplit.
-	// This eliminates the intermediate decompressed file, halving peak disk usage.
 	fifoPath := filepath.Join(tmpDir, fmt.Sprintf("stream-%d-%d.fifo", os.Getpid(), time.Now().UnixNano()))
 	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
-		// FIFO not supported — fall back to file-based pipeline
-		return runPipelineWithFile(ctx, url, targetNPIs, tmpDir, splitDir, tracker)
+		result.Err = fmt.Errorf("creating FIFO: %w", err)
+		return result
 	}
 	defer os.Remove(fifoPath)
 
-	// Start download + decompress to FIFO in background goroutine.
-	// The goroutine blocks on os.OpenFile until jsplit opens the FIFO for reading.
 	tracker.SetStage("Downloading + Splitting")
 	dlErrCh := make(chan error, 1)
 	go func() {
@@ -63,26 +121,25 @@ func RunPipeline(
 		})
 	}()
 
-	// Split JSON into NDJSON — reads from the FIFO as jsplit's input.
-	// This call blocks until all data is read (download complete + EOF).
 	splitResult, err := mrf.SplitFile(fifoPath, splitDir)
+
+	// Always drain the download goroutine
+	dlErr := <-dlErrCh
+
 	if err != nil {
 		result.Err = fmt.Errorf("split: %w", err)
 		return result
 	}
-
-	// Wait for the download goroutine to finish (should already be done when jsplit returns)
-	if dlErr := <-dlErrCh; dlErr != nil {
+	if dlErr != nil {
 		result.Err = fmt.Errorf("download: %w", dlErr)
 		return result
 	}
 
-	// Parse phases A & B
 	return runParsePhases(ctx, result, splitResult, targetNPIs, url, tracker)
 }
 
-// runPipelineWithFile is the fallback pipeline that writes the decompressed file to disk
-// before splitting. Used when FIFOs are not available.
+// runPipelineWithFile downloads the full decompressed file to disk before splitting.
+// More resilient than FIFO streaming since the download completes fully before jsplit runs.
 func runPipelineWithFile(
 	ctx context.Context,
 	url string,

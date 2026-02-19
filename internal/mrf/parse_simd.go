@@ -10,7 +10,7 @@ import (
 
 // scanProviderRefFileSimd parses provider_references NDJSON using simdjson.
 // Full native extraction — no json.Unmarshal needed.
-func scanProviderRefFileSimd(filePath string, targetNPIs map[int64]struct{}, matched *MatchedProviders, onRefScanned func()) error {
+func scanProviderRefFileSimd(filePath string, targetNPIs map[int64]struct{}, npiPatterns [][]byte, matched *MatchedProviders, onRefScanned func()) error {
 	f, err := os.Open(filePath)
 	if err != nil {
 		return err
@@ -28,13 +28,18 @@ func scanProviderRefFileSimd(filePath string, targetNPIs map[int64]struct{}, mat
 			continue
 		}
 
-		pj, err = simdjson.Parse(line, pj)
-		if err != nil {
+		if onRefScanned != nil {
+			onRefScanned()
+		}
+
+		// Pre-filter: skip lines that don't contain any target NPI as a substring.
+		if !lineContainsAny(line, npiPatterns) {
 			continue
 		}
 
-		if onRefScanned != nil {
-			onRefScanned()
+		pj, err = simdjson.Parse(line, pj)
+		if err != nil {
+			continue
 		}
 
 		pj.ForEach(func(i simdjson.Iter) error {
@@ -53,7 +58,7 @@ func extractProviderRef(i simdjson.Iter, targetNPIs map[int64]struct{}, matched 
 	if err != nil {
 		return
 	}
-	groupID, err := idElem.Iter.Int()
+	groupID, err := idElem.Iter.Float()
 	if err != nil {
 		return
 	}
@@ -106,8 +111,8 @@ func extractProviderRef(i simdjson.Iter, targetNPIs map[int64]struct{}, matched 
 
 		for _, npi := range npis {
 			if _, ok := targetNPIs[npi]; ok {
-				matched.ByGroupID[int(groupID)] = append(
-					matched.ByGroupID[int(groupID)],
+				matched.ByGroupID[groupID] = append(
+					matched.ByGroupID[groupID],
 					ProviderInfo{NPI: npi, TIN: tin},
 				)
 			}
@@ -197,9 +202,9 @@ func checkNPIMatchSimd(i simdjson.Iter, targetNPIs map[int64]struct{}, matchedPr
 		if matchedProviders != nil && len(matchedProviders.ByGroupID) > 0 {
 			if refsElem, refErr := rateIter.FindElement(nil, "provider_references"); refErr == nil {
 				if refsArr, arrErr := refsElem.Iter.Array(nil); arrErr == nil {
-					if refs, intErr := refsArr.AsInteger(); intErr == nil {
+					if refs, floatErr := refsArr.AsFloat(); floatErr == nil {
 						for _, ref := range refs {
-							if _, ok := matchedProviders.ByGroupID[int(ref)]; ok {
+							if _, ok := matchedProviders.ByGroupID[ref]; ok {
 								found = true
 								return
 							}

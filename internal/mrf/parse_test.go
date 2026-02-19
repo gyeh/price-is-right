@@ -80,7 +80,7 @@ func TestParseInNetwork_ViaProviderReferences(t *testing.T) {
 
 	targetNPIs := map[int64]struct{}{1234567890: {}}
 	matchedProviders := &MatchedProviders{
-		ByGroupID: map[int][]ProviderInfo{
+		ByGroupID: map[float64][]ProviderInfo{
 			1: {{NPI: 1234567890, TIN: TIN{Type: "ein", Value: "12-3456789"}}},
 		},
 	}
@@ -132,7 +132,7 @@ func TestParseInNetwork_InlineProviderGroups(t *testing.T) {
 
 	targetNPIs := map[int64]struct{}{1234567890: {}}
 	// Empty matchedProviders — testing inline path only
-	matchedProviders := &MatchedProviders{ByGroupID: map[int][]ProviderInfo{}}
+	matchedProviders := &MatchedProviders{ByGroupID: map[float64][]ProviderInfo{}}
 
 	var results []RateResult
 	err := ParseInNetwork(
@@ -166,7 +166,7 @@ func TestParseInNetwork_NoMatchSkipped(t *testing.T) {
 	f := writeTestFile(t, dir, "in_network_00.jsonl", ndjson)
 
 	targetNPIs := map[int64]struct{}{1234567890: {}}
-	matchedProviders := &MatchedProviders{ByGroupID: map[int][]ProviderInfo{}}
+	matchedProviders := &MatchedProviders{ByGroupID: map[float64][]ProviderInfo{}}
 
 	var results []RateResult
 	err := ParseInNetwork(
@@ -195,7 +195,7 @@ func TestParseInNetwork_MultipleProvidersPrices(t *testing.T) {
 
 	targetNPIs := map[int64]struct{}{1111111111: {}, 2222222222: {}}
 	matchedProviders := &MatchedProviders{
-		ByGroupID: map[int][]ProviderInfo{
+		ByGroupID: map[float64][]ProviderInfo{
 			1: {{NPI: 1111111111, TIN: TIN{Type: "ein", Value: "11-1111111"}}},
 			2: {{NPI: 2222222222, TIN: TIN{Type: "ein", Value: "22-2222222"}}},
 		},
@@ -379,9 +379,10 @@ func TestStdlibProviderRefsDirectly(t *testing.T) {
 	f := writeTestFile(t, dir, "provider_references_00.jsonl", ndjson)
 
 	targetNPIs := map[int64]struct{}{1234567890: {}}
-	matched := &MatchedProviders{ByGroupID: make(map[int][]ProviderInfo)}
+	matched := &MatchedProviders{ByGroupID: make(map[float64][]ProviderInfo)}
 
-	err := scanProviderRefFileStdlib(f, targetNPIs, matched, nil)
+	patterns := npiBytePatterns(targetNPIs)
+	err := scanProviderRefFileStdlib(f, targetNPIs, patterns, matched, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,9 +402,10 @@ func TestSimdProviderRefsDirectly(t *testing.T) {
 	f := writeTestFile(t, dir, "provider_references_00.jsonl", ndjson)
 
 	targetNPIs := map[int64]struct{}{1234567890: {}}
-	matched := &MatchedProviders{ByGroupID: make(map[int][]ProviderInfo)}
+	matched := &MatchedProviders{ByGroupID: make(map[float64][]ProviderInfo)}
 
-	err := scanProviderRefFileSimd(f, targetNPIs, matched, nil)
+	patterns := npiBytePatterns(targetNPIs)
+	err := scanProviderRefFileSimd(f, targetNPIs, patterns, matched, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +433,7 @@ func TestSimdInNetworkDirectly(t *testing.T) {
 
 	targetNPIs := map[int64]struct{}{1234567890: {}}
 	matchedProviders := &MatchedProviders{
-		ByGroupID: map[int][]ProviderInfo{
+		ByGroupID: map[float64][]ProviderInfo{
 			1: {{NPI: 1234567890, TIN: TIN{Type: "ein", Value: "12-3456789"}}},
 		},
 	}
@@ -461,7 +463,7 @@ func TestSimdInNetworkInlineProviderGroups(t *testing.T) {
 	f := writeTestFile(t, dir, "in_network_00.jsonl", ndjson)
 
 	targetNPIs := map[int64]struct{}{1234567890: {}}
-	matchedProviders := &MatchedProviders{ByGroupID: map[int][]ProviderInfo{}}
+	matchedProviders := &MatchedProviders{ByGroupID: map[float64][]ProviderInfo{}}
 
 	var results []RateResult
 	err := scanInNetworkFileSimd(f, targetNPIs, matchedProviders, "test", nil,

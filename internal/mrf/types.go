@@ -14,7 +14,7 @@ type ProviderGroup struct {
 
 // ProviderReference is a top-level provider_references entry.
 type ProviderReference struct {
-	ProviderGroupID int             `json:"provider_group_id"`
+	ProviderGroupID float64         `json:"provider_group_id"`
 	ProviderGroups  []ProviderGroup `json:"provider_groups"`
 }
 
@@ -31,7 +31,7 @@ type NegotiatedPrice struct {
 
 // NegotiatedRate is a rate entry within an in_network item.
 type NegotiatedRate struct {
-	ProviderReferences []int           `json:"provider_references"`
+	ProviderReferences []float64       `json:"provider_references"`
 	ProviderGroups     []ProviderGroup `json:"provider_groups"`
 	NegotiatedPrices   []NegotiatedPrice `json:"negotiated_prices"`
 }
