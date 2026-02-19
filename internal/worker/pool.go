@@ -19,6 +19,9 @@ type Pool struct {
 func (p *Pool) Run(ctx context.Context, urls []string) []PipelineResult {
 	results := make([]PipelineResult, len(urls))
 
+	p.Progress.StartDiskMonitor(p.TmpDir)
+	defer p.Progress.StopDiskMonitor()
+
 	sem := make(chan struct{}, p.Workers)
 	var wg sync.WaitGroup
 

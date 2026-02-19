@@ -5,10 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -204,10 +210,11 @@ func newSearchCmd() *cobra.Command {
 				mgr = progress.NewMPBManager()
 			}
 
-			// Log parser info
+			// Log URL and environment info
+			logURLInfo(ctx, urls)
 			fmt.Fprintf(os.Stderr, "Parser: %s\n", mrf.ParserName())
 			fmt.Fprintf(os.Stderr, "Temp dir: %s (%s available)\n", tmpDir, humanBytesCLI(avail))
-			fmt.Fprintf(os.Stderr, "Searching %d files for %d NPIs with %d workers\n\n", len(urls), len(npis), workers)
+			fmt.Fprintf(os.Stderr, "Workers: %d\n\n", workers)
 
 			// Run the worker pool
 			startTime := time.Now()
@@ -516,6 +523,235 @@ func availableDiskSpace(path string) uint64 {
 		return 0
 	}
 	return stat.Bavail * uint64(stat.Bsize)
+}
+
+// logURLInfo analyzes the URLs and logs CDN/vendor, region, and file size distribution.
+func logURLInfo(ctx context.Context, urls []string) {
+	if len(urls) == 0 {
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "Files: %d\n", len(urls))
+
+	// Detect CDN/vendor and region from URL hostnames
+	vendors := map[string]int{}
+	regions := map[string]int{}
+	for _, rawURL := range urls {
+		vendor, region := detectCDN(rawURL)
+		if vendor != "" {
+			vendors[vendor]++
+		}
+		if region != "" {
+			regions[region]++
+		}
+	}
+	if len(vendors) > 0 {
+		parts := make([]string, 0, len(vendors))
+		for v, count := range vendors {
+			if count == len(urls) {
+				parts = append(parts, v)
+			} else {
+				parts = append(parts, fmt.Sprintf("%s (%d)", v, count))
+			}
+		}
+		sort.Strings(parts)
+		fmt.Fprintf(os.Stderr, "CDN: %s\n", strings.Join(parts, ", "))
+	}
+	// If no region detected from URLs, try IP-based geolocation on first URL's host
+	if len(regions) == 0 && len(urls) > 0 {
+		if r := detectRegionFromIP(ctx, urls[0]); r != "" {
+			regions[r] = len(urls)
+		}
+	}
+	if len(regions) > 0 {
+		parts := make([]string, 0, len(regions))
+		for r, count := range regions {
+			if count == len(urls) {
+				parts = append(parts, r)
+			} else {
+				parts = append(parts, fmt.Sprintf("%s (%d)", r, count))
+			}
+		}
+		sort.Strings(parts)
+		fmt.Fprintf(os.Stderr, "Region: %s\n", strings.Join(parts, ", "))
+	}
+
+	// Fetch file sizes via HEAD requests (concurrent, with timeout)
+	sizes := fetchFileSizes(ctx, urls)
+	var known []int64
+	for _, s := range sizes {
+		if s > 0 {
+			known = append(known, s)
+		}
+	}
+	if len(known) > 0 {
+		sort.Slice(known, func(i, j int) bool { return known[i] < known[j] })
+		var total int64
+		for _, s := range known {
+			total += s
+		}
+		min, max := known[0], known[len(known)-1]
+		avg := total / int64(len(known))
+		fmt.Fprintf(os.Stderr, "Size (compressed): %s total, %s avg, %s min, %s max",
+			humanBytesCLI(uint64(total)), humanBytesCLI(uint64(avg)),
+			humanBytesCLI(uint64(min)), humanBytesCLI(uint64(max)))
+		if len(known) < len(urls) {
+			fmt.Fprintf(os.Stderr, " (%d/%d responded)", len(known), len(urls))
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
+// detectCDN identifies the CDN vendor and region from a URL.
+func detectCDN(rawURL string) (vendor, region string) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", ""
+	}
+	host := strings.ToLower(u.Hostname())
+
+	switch {
+	case strings.HasSuffix(host, ".cloudfront.net"):
+		return "CloudFront", ""
+	case strings.Contains(u.RawQuery, "Key-Pair-Id="):
+		// CloudFront signed URL on custom domain
+		return "CloudFront", ""
+	case strings.HasSuffix(host, ".amazonaws.com"):
+		// S3: s3.us-east-1.amazonaws.com or bucket.s3.region.amazonaws.com
+		parts := strings.Split(host, ".")
+		for i, p := range parts {
+			if p == "s3" && i+1 < len(parts) && parts[i+1] != "amazonaws" {
+				return "AWS S3", parts[i+1]
+			}
+		}
+		return "AWS S3", ""
+	case strings.HasSuffix(host, ".storage.googleapis.com") || host == "storage.googleapis.com":
+		return "Google Cloud Storage", ""
+	case strings.HasSuffix(host, ".blob.core.windows.net"):
+		return "Azure Blob Storage", ""
+	case strings.Contains(host, ".akamai"):
+		return "Akamai", ""
+	case strings.HasSuffix(host, ".fastly.net"):
+		return "Fastly", ""
+	case strings.HasSuffix(host, ".cloudflare.com") || strings.HasSuffix(host, ".r2.dev"):
+		return "Cloudflare", ""
+	case strings.HasSuffix(host, ".bcbs.com"):
+		// BCBS MRF hosting — typically CloudFront behind custom domain
+		if strings.Contains(u.RawQuery, "Key-Pair-Id=") || strings.Contains(u.RawQuery, "Signature=") {
+			return "CloudFront (BCBS)", ""
+		}
+		return "BCBS", ""
+	}
+	return "", ""
+}
+
+// detectRegionFromIP resolves the hostname from a URL and uses IP geolocation
+// to determine the server's geographic region. Uses ip-api.com (free, no key needed).
+func detectRegionFromIP(ctx context.Context, rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	host := u.Hostname()
+	if host == "" {
+		return ""
+	}
+
+	// Resolve hostname to IP
+	resolveCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupHost(resolveCtx, host)
+	if err != nil || len(ips) == 0 {
+		return ""
+	}
+	ip := ips[0]
+
+	// Query ip-api.com for geolocation
+	apiCtx, apiCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer apiCancel()
+
+	req, err := http.NewRequestWithContext(apiCtx, "GET",
+		fmt.Sprintf("http://ip-api.com/json/%s?fields=status,regionName,country,city,isp", ip), nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ""
+	}
+
+	var geo struct {
+		Status     string `json:"status"`
+		Country    string `json:"country"`
+		RegionName string `json:"regionName"`
+		City       string `json:"city"`
+		ISP        string `json:"isp"`
+	}
+	if json.Unmarshal(body, &geo) != nil || geo.Status != "success" {
+		return ""
+	}
+
+	// Build a human-readable location string
+	parts := []string{}
+	if geo.City != "" {
+		parts = append(parts, geo.City)
+	}
+	if geo.RegionName != "" {
+		parts = append(parts, geo.RegionName)
+	}
+	if geo.Country != "" && geo.Country != "United States" {
+		parts = append(parts, geo.Country)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	location := strings.Join(parts, ", ")
+	if geo.ISP != "" {
+		location += " (" + geo.ISP + ")"
+	}
+	return location
+}
+
+// fetchFileSizes does concurrent HEAD requests to get Content-Length for each URL.
+func fetchFileSizes(ctx context.Context, urls []string) []int64 {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	sizes := make([]int64, len(urls))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 10) // limit concurrent HEAD requests
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	for i, rawURL := range urls {
+		wg.Add(1)
+		go func(idx int, u string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			req, err := http.NewRequestWithContext(ctx, "HEAD", u, nil)
+			if err != nil {
+				return
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			resp.Body.Close()
+			if resp.ContentLength > 0 {
+				sizes[idx] = resp.ContentLength
+			}
+		}(i, rawURL)
+	}
+	wg.Wait()
+	return sizes
 }
 
 func humanBytesCLI(b uint64) string {

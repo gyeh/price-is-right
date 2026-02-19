@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/vbauerster/mpb/v8"
@@ -24,13 +25,16 @@ type Manager interface {
 	NewTracker(index, total int, filename string) Tracker
 	Wait()
 	SetOverallStats(filesComplete, filesMatched int, totalRates int64)
+	StartDiskMonitor(tmpDir string)
+	StopDiskMonitor()
 }
 
 // MPBManager implements Manager using the mpb multi-progress-bar library.
 type MPBManager struct {
-	container *mpb.Progress
-	mu        sync.Mutex
+	container  *mpb.Progress
+	mu         sync.Mutex
 	overallBar *mpb.Bar
+	diskStop   chan struct{}
 }
 
 // NewMPBManager creates a new mpb-based progress manager.
@@ -80,6 +84,68 @@ func (m *MPBManager) Wait() {
 // SetOverallStats updates overall progress (currently logged via stage names).
 func (m *MPBManager) SetOverallStats(filesComplete, filesMatched int, totalRates int64) {
 	// Could add an overall bar in the future
+}
+
+// StartDiskMonitor adds a status line showing real-time disk usage for tmpDir.
+func (m *MPBManager) StartDiskMonitor(tmpDir string) {
+	diskVal := &atomic.Value{}
+	diskVal.Store("")
+
+	m.mu.Lock()
+	bar := m.container.AddBar(0,
+		mpb.PrependDecorators(
+			decor.Any(func(s decor.Statistics) string {
+				return diskVal.Load().(string)
+			}),
+		),
+	)
+	m.mu.Unlock()
+
+	m.diskStop = make(chan struct{})
+	startTime := time.Now()
+	// Snapshot initial usage to track delta from our process
+	var baselineUsed uint64
+	var stat0 syscall.Statfs_t
+	if syscall.Statfs(tmpDir, &stat0) == nil {
+		baselineUsed = (stat0.Blocks - stat0.Bavail) * uint64(stat0.Bsize)
+	}
+	var peakDelta uint64
+	go func() {
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			elapsed := time.Since(startTime).Truncate(time.Second)
+			var stat syscall.Statfs_t
+			if err := syscall.Statfs(tmpDir, &stat); err == nil {
+				avail := stat.Bavail * uint64(stat.Bsize)
+				used := (stat.Blocks - stat.Bavail) * uint64(stat.Bsize)
+				delta := uint64(0)
+				if used > baselineUsed {
+					delta = used - baselineUsed
+				}
+				if delta > peakDelta {
+					peakDelta = delta
+				}
+				diskVal.Store(fmt.Sprintf("Elapsed: %s  |  Disk: %s used (peak %s), %s free",
+					elapsed, humanBytesUint(delta), humanBytesUint(peakDelta), humanBytesUint(avail)))
+			} else {
+				diskVal.Store(fmt.Sprintf("Elapsed: %s", elapsed))
+			}
+			select {
+			case <-ticker.C:
+			case <-m.diskStop:
+				bar.Abort(false)
+				return
+			}
+		}
+	}()
+}
+
+// StopDiskMonitor stops the disk usage monitor.
+func (m *MPBManager) StopDiskMonitor() {
+	if m.diskStop != nil {
+		close(m.diskStop)
+	}
 }
 
 type mpbTracker struct {
@@ -181,6 +247,8 @@ func (m *NoopManager) NewTracker(index, total int, filename string) Tracker {
 }
 
 func (m *NoopManager) Wait() {}
+func (m *NoopManager) StartDiskMonitor(tmpDir string) {}
+func (m *NoopManager) StopDiskMonitor()               {}
 
 func (m *NoopManager) SetOverallStats(filesComplete, filesMatched int, totalRates int64) {
 	atomic.StoreInt32(&m.FilesComplete, int32(filesComplete))
@@ -212,6 +280,27 @@ func humanBytes(b int64) string {
 		gb = 1024 * mb
 	)
 	switch {
+	case b >= gb:
+		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
+	case b >= mb:
+		return fmt.Sprintf("%.1f MB", float64(b)/float64(mb))
+	case b >= kb:
+		return fmt.Sprintf("%.1f KB", float64(b)/float64(kb))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
+}
+
+func humanBytesUint(b uint64) string {
+	const (
+		kb uint64 = 1024
+		mb        = 1024 * kb
+		gb        = 1024 * mb
+		tb        = 1024 * gb
+	)
+	switch {
+	case b >= tb:
+		return fmt.Sprintf("%.1f TB", float64(b)/float64(tb))
 	case b >= gb:
 		return fmt.Sprintf("%.1f GB", float64(b)/float64(gb))
 	case b >= mb:
