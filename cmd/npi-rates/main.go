@@ -89,11 +89,11 @@ func newSearchCmd() *cobra.Command {
 			sigCh := make(chan os.Signal, 2)
 			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 			go func() {
-				<-sigCh
-				fmt.Fprintln(os.Stderr, "\nInterrupted, cleaning up... (^C again to force quit)")
+				sig := <-sigCh
+				fmt.Fprintf(os.Stderr, "\nReceived %s, shutting down... (^C again to force quit)\n", sig)
 				cancel()
-				<-sigCh
-				fmt.Fprintln(os.Stderr, "\nForce quit.")
+				sig = <-sigCh
+				fmt.Fprintf(os.Stderr, "\nReceived %s, force quit.\n", sig)
 				os.Exit(1)
 			}()
 

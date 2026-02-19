@@ -164,7 +164,7 @@ func scanProviderRefFileStdlib(filePath string, targetNPIs map[int64]struct{}, n
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
+	scanner.Buffer(make([]byte, 0, 4*1024*1024), 512*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
@@ -217,7 +217,7 @@ func scanInNetworkFileStdlib(
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
+	scanner.Buffer(make([]byte, 0, 4*1024*1024), 512*1024*1024)
 
 	for scanner.Scan() {
 		line := scanner.Bytes()

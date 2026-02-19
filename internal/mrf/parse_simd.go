@@ -18,7 +18,7 @@ func scanProviderRefFileSimd(filePath string, targetNPIs map[int64]struct{}, npi
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
+	scanner.Buffer(make([]byte, 0, 4*1024*1024), 512*1024*1024)
 
 	var pj *simdjson.ParsedJson
 
@@ -138,7 +138,7 @@ func scanInNetworkFileSimd(
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 4*1024*1024), 64*1024*1024)
+	scanner.Buffer(make([]byte, 0, 4*1024*1024), 512*1024*1024)
 
 	var pj *simdjson.ParsedJson
 
