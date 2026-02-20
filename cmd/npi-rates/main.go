@@ -57,6 +57,7 @@ func newSearchCmd() *cobra.Command {
 		logProgress  bool
 		noFIFO       bool
 		streamMode   bool
+		noSimd       bool
 
 		// Cloud mode flags (orchestrator)
 		cloudMode   bool
@@ -75,6 +76,10 @@ func newSearchCmd() *cobra.Command {
 		Use:   "search",
 		Short: "Search MRF files for negotiated rates matching specified NPIs",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if noSimd {
+				mrf.DisableSimd()
+			}
+
 			// Resolve NPIs — either from --npi or --provider-name
 			var npis []int64
 			if providerName != "" {
@@ -332,6 +337,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&logProgress, "log-progress", false, "Use line-based progress logging (for non-TTY environments)")
 	cmd.Flags().BoolVar(&noFIFO, "no-fifo", false, "Use file-based pipeline instead of FIFO streaming")
 	cmd.Flags().BoolVar(&streamMode, "stream", false, "Stream directly from download to parsing (no disk, constant memory)")
+	cmd.Flags().BoolVar(&noSimd, "no-simd", false, "Disable simdjson and use stdlib encoding/json")
 
 	// Cloud mode flags (orchestrator)
 	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Fargate)")
