@@ -1,9 +1,7 @@
-package main
+package modal
 
 import (
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"testing"
 
 	"github.com/gyeh/npi-rates/internal/mrf"
@@ -96,23 +94,18 @@ func TestMergeResults(t *testing.T) {
 		t.Fatalf("mergeResults: %v", err)
 	}
 
-	// searched_files sums
 	if merged.SearchParams.SearchedFiles != 8 {
 		t.Errorf("searched_files: got %d, want 8", merged.SearchParams.SearchedFiles)
 	}
-	// matched_files sums
 	if merged.SearchParams.MatchedFiles != 3 {
 		t.Errorf("matched_files: got %d, want 3", merged.SearchParams.MatchedFiles)
 	}
-	// duration_seconds takes max
 	if merged.SearchParams.DurationSeconds != 15.2 {
 		t.Errorf("duration: got %f, want 15.2", merged.SearchParams.DurationSeconds)
 	}
-	// results concatenated
 	if len(merged.Results) != 3 {
 		t.Errorf("results: got %d, want 3", len(merged.Results))
 	}
-	// NPIs from first shard
 	if len(merged.SearchParams.NPIs) != 1 || merged.SearchParams.NPIs[0] != 1770671182 {
 		t.Errorf("npis: got %v, want [1770671182]", merged.SearchParams.NPIs)
 	}
@@ -153,55 +146,5 @@ func TestMergeResultsSkipsInvalidJSON(t *testing.T) {
 	}
 	if len(merged.Results) != 1 {
 		t.Errorf("results: got %d, want 1", len(merged.Results))
-	}
-}
-
-func TestReadURLs(t *testing.T) {
-	content := `# Comment line
-https://example.com/file1.json.gz
-
-https://example.com/file2.json.gz
-# Another comment
-
-https://example.com/file3.json.gz
-`
-	dir := t.TempDir()
-	path := filepath.Join(dir, "urls.txt")
-	os.WriteFile(path, []byte(content), 0644)
-
-	urls, err := readURLs(path)
-	if err != nil {
-		t.Fatalf("readURLs: %v", err)
-	}
-	if len(urls) != 3 {
-		t.Fatalf("expected 3 URLs, got %d: %v", len(urls), urls)
-	}
-	expected := []string{
-		"https://example.com/file1.json.gz",
-		"https://example.com/file2.json.gz",
-		"https://example.com/file3.json.gz",
-	}
-	for i, u := range urls {
-		if u != expected[i] {
-			t.Errorf("url[%d]: got %q, want %q", i, u, expected[i])
-		}
-	}
-}
-
-func TestReadURLsEmpty(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "empty.txt")
-	os.WriteFile(path, []byte("# only comments\n\n"), 0644)
-
-	_, err := readURLs(path)
-	if err == nil {
-		t.Error("expected error for file with no URLs")
-	}
-}
-
-func TestReadURLsNotFound(t *testing.T) {
-	_, err := readURLs("/nonexistent/path/urls.txt")
-	if err == nil {
-		t.Error("expected error for nonexistent file")
 	}
 }

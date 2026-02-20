@@ -1,33 +1,25 @@
-// Package main implements a Modal-based distributed deployment CLI for npi-rates.
-// It shards URLs across parallel Modal sandboxes, runs the npi-rates search binary
-// in each, and merges results locally.
-//
-// The binary is baked into a Modal Image (via cross-compile + SnapshotFilesystem),
-// matching the Python deploy_modal.py approach where the image contains /npi-rates.
-// URLs are passed to each worker via stdin, avoiding volume consistency issues.
-package main
+// Package modal implements distributed MRF search orchestration using Modal sandboxes.
+// It shards URLs across parallel sandboxes, runs the npi-rates search binary in each,
+// and merges results locally.
+package modal
 
 import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
-	modal "github.com/modal-labs/libmodal/modal-go"
+	modalsdk "github.com/modal-labs/libmodal/modal-go"
 	"github.com/vbauerster/mpb/v8"
 	"github.com/vbauerster/mpb/v8/decor"
 
@@ -35,19 +27,20 @@ import (
 	"github.com/gyeh/npi-rates/internal/output"
 )
 
-type config struct {
-	npi      string
-	urlsFile string
-	shards   int
-	workers  int
-	cpu      float64
-	memory   int
-	timeout  time.Duration
-	cloud    string
-	region   string
-	image    string
-	output   string
-	progress bool
+// Config holds configuration for a Modal-based distributed search.
+type Config struct {
+	NPI             string
+	URLs            []string
+	OutputFile      string
+	Shards          int
+	WorkersPerShard int
+	CPU             float64
+	MemoryMiB       int
+	Timeout         time.Duration
+	Cloud           string // Modal cloud provider (aws, gcp)
+	Region          string
+	Image           string // pre-built Docker image (skip cross-compile)
+	Progress        bool
 }
 
 type shardResult struct {
@@ -61,7 +54,6 @@ type shardResult struct {
 var (
 	reURLLine = regexp.MustCompile(`\[URL\|\s*\d+/\d+\]\s+\[([^\]]+)\]\s+(.+)`)
 	rePct     = regexp.MustCompile(`\((\d+)%\)`)
-	reRates   = regexp.MustCompile(`(\d+) rates`)
 )
 
 type shardTracker struct {
@@ -144,86 +136,24 @@ func (t *shardTracker) complete() {
 	t.bar.Abort(false)
 }
 
-// isTerminal returns true if stderr is connected to a terminal.
-func isTerminal() bool {
-	fi, err := os.Stderr.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Mode()&os.ModeCharDevice != 0
-}
+// RunSearch executes a distributed search across Modal sandboxes.
+func RunSearch(ctx context.Context, cfg Config) error {
+	shards := shardURLs(cfg.URLs, cfg.Shards)
 
-func main() {
-	cfg := parseFlags()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		logf("Interrupted, cleaning up...")
-		cancel()
-		<-sigCh
-		os.Exit(1)
-	}()
-
-	if err := run(ctx, cfg); err != nil {
-		log.Fatalf("Error: %v", err)
-	}
-}
-
-func parseFlags() config {
-	var cfg config
-	flag.StringVar(&cfg.npi, "npi", "", "NPI number(s) (required)")
-	flag.StringVar(&cfg.urlsFile, "urls-file", "", "File containing MRF URLs (required)")
-	flag.IntVar(&cfg.shards, "shards", 100, "Number of URL shards")
-	flag.IntVar(&cfg.workers, "workers", 1, "Workers per shard")
-	flag.Float64Var(&cfg.cpu, "cpu", 2.0, "CPU cores per sandbox")
-	flag.IntVar(&cfg.memory, "memory", 4096, "Memory MB per sandbox")
-	flag.DurationVar(&cfg.timeout, "timeout", time.Hour, "Timeout per sandbox")
-	flag.StringVar(&cfg.cloud, "cloud", "aws", "Cloud provider")
-	flag.StringVar(&cfg.region, "region", "us-east-1", "Region")
-	flag.StringVar(&cfg.image, "image", "", "Pre-built Docker image (skip cross-compile)")
-	flag.StringVar(&cfg.output, "o", "", "Output file path")
-	flag.BoolVar(&cfg.progress, "progress", isTerminal(), "Show progress bars (default: auto-detect TTY)")
-	flag.Parse()
-
-	if cfg.npi == "" {
-		log.Fatal("--npi is required")
-	}
-	if cfg.urlsFile == "" {
-		log.Fatal("--urls-file is required")
-	}
-	if cfg.output == "" {
-		cfg.output = fmt.Sprintf("results_%s.json", time.Now().Format("20060102_150405"))
-	}
-
-	return cfg
-}
-
-func run(ctx context.Context, cfg config) error {
-	urls, err := readURLs(cfg.urlsFile)
-	if err != nil {
-		return fmt.Errorf("reading URLs: %w", err)
-	}
-	shards := shardURLs(urls, cfg.shards)
-
-	logf("NPI: %s", cfg.npi)
-	logf("Files: %d URLs across %d shards", len(urls), len(shards))
-	logf("Infra: %.0f CPU, %d MB memory, %s/%s", cfg.cpu, cfg.memory, cfg.cloud, cfg.region)
-	logf("Workers per shard: %d", cfg.workers)
+	logf("NPI: %s", cfg.NPI)
+	logf("Files: %d URLs across %d shards", len(cfg.URLs), len(shards))
+	logf("Infra: %.0f CPU, %d MB memory, %s/%s", cfg.CPU, cfg.MemoryMiB, cfg.Cloud, cfg.Region)
+	logf("Workers per shard: %d", cfg.WorkersPerShard)
 
 	// Create Modal client
-	client, err := modal.NewClient()
+	client, err := modalsdk.NewClient()
 	if err != nil {
 		return fmt.Errorf("creating Modal client: %w", err)
 	}
 	defer client.Close()
 
 	// Get app
-	app, err := client.Apps.FromName(ctx, "npi-rates-deploy", &modal.AppFromNameParams{
+	app, err := client.Apps.FromName(ctx, "npi-rates-deploy", &modalsdk.AppFromNameParams{
 		CreateIfMissing: true,
 	})
 	if err != nil {
@@ -231,10 +161,10 @@ func run(ctx context.Context, cfg config) error {
 	}
 
 	// Build image with /npi-rates binary baked in
-	var img *modal.Image
-	if cfg.image != "" {
-		logf("Using pre-built image: %s", cfg.image)
-		img = client.Images.FromRegistry(cfg.image, nil)
+	var img *modalsdk.Image
+	if cfg.Image != "" {
+		logf("Using pre-built image: %s", cfg.Image)
+		img = client.Images.FromRegistry(cfg.Image, nil)
 	} else {
 		img, err = buildImage(ctx, client, app)
 		if err != nil {
@@ -242,7 +172,7 @@ func run(ctx context.Context, cfg config) error {
 		}
 	}
 
-	// Run all shards — URLs are passed via stdin, no volume needed
+	// Run all shards
 	start := time.Now()
 	results := runShards(ctx, client, app, img, cfg, shards)
 	wallTime := time.Since(start)
@@ -269,7 +199,7 @@ func run(ctx context.Context, cfg config) error {
 	}
 	merged.SearchParams.DurationSeconds = wallTime.Seconds()
 
-	if err := output.WriteResults(cfg.output, merged.SearchParams, merged.Results); err != nil {
+	if err := output.WriteResults(cfg.OutputFile, merged.SearchParams, merged.Results); err != nil {
 		return fmt.Errorf("writing output: %w", err)
 	}
 
@@ -282,16 +212,15 @@ func run(ctx context.Context, cfg config) error {
 	if failCount > 0 {
 		logf("Warning: %d/%d shards failed", failCount, len(results))
 	}
-	logf("Results saved to %s", cfg.output)
+	logf("Results saved to %s", cfg.OutputFile)
 
 	return nil
 }
 
 // buildImage cross-compiles the npi-rates binary, uploads it into a temporary
 // sandbox, and snapshots the filesystem to produce a Modal Image with /npi-rates
-// baked in. This mirrors deploy_modal.py's from_dockerfile approach.
-func buildImage(ctx context.Context, client *modal.Client, app *modal.App) (*modal.Image, error) {
-	// Cross-compile
+// baked in.
+func buildImage(ctx context.Context, client *modalsdk.Client, app *modalsdk.App) (*modalsdk.Image, error) {
 	logf("Cross-compiling npi-rates for linux/amd64...")
 	binaryPath, err := crossCompile(ctx)
 	if err != nil {
@@ -317,7 +246,7 @@ func buildImage(ctx context.Context, client *modal.Client, app *modal.App) (*mod
 
 	// Create builder sandbox, upload binary, snapshot filesystem
 	logf("Uploading binary to image...")
-	sb, err := client.Sandboxes.Create(ctx, app, base, &modal.SandboxCreateParams{
+	sb, err := client.Sandboxes.Create(ctx, app, base, &modalsdk.SandboxCreateParams{
 		Command: []string{"sleep", "3600"},
 		Timeout: 10 * time.Minute,
 	})
@@ -385,7 +314,7 @@ func crossCompile(ctx context.Context) (string, error) {
 	return outPath, nil
 }
 
-func runShards(ctx context.Context, client *modal.Client, app *modal.App, img *modal.Image, cfg config, shards [][]string) []shardResult {
+func runShards(ctx context.Context, client *modalsdk.Client, app *modalsdk.App, img *modalsdk.Image, cfg Config, shards [][]string) []shardResult {
 	results := make([]shardResult, len(shards))
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 50)
@@ -395,7 +324,7 @@ func runShards(ctx context.Context, client *modal.Client, app *modal.App, img *m
 	var shardsComplete int64
 	var statusStop chan struct{}
 
-	if cfg.progress {
+	if cfg.Progress {
 		container = mpb.New(mpb.WithWidth(60), mpb.WithOutput(os.Stderr))
 		trackers = make([]*shardTracker, len(shards))
 		for i := range shards {
@@ -443,7 +372,7 @@ func runShards(ctx context.Context, client *modal.Client, app *modal.App, img *m
 				tracker = trackers[idx]
 			}
 			results[idx] = runShard(ctx, client, app, img, cfg, idx, urls, tracker)
-			if cfg.progress {
+			if cfg.Progress {
 				atomic.AddInt64(&shardsComplete, 1)
 			}
 		}(i, urls)
@@ -460,9 +389,8 @@ func runShards(ctx context.Context, client *modal.Client, app *modal.App, img *m
 }
 
 // runShard creates a worker sandbox that receives URLs via stdin, writes them
-// to a local temp file, then runs /npi-rates search. This avoids volume
-// consistency issues — each sandbox is fully self-contained.
-func runShard(ctx context.Context, client *modal.Client, app *modal.App, img *modal.Image, cfg config, shardIndex int, urls []string, tracker *shardTracker) shardResult {
+// to a local temp file, then runs /npi-rates search.
+func runShard(ctx context.Context, client *modalsdk.Client, app *modalsdk.App, img *modalsdk.Image, cfg Config, shardIndex int, urls []string, tracker *shardTracker) shardResult {
 	result := shardResult{index: shardIndex}
 	prefix := fmt.Sprintf("[shard-%03d]", shardIndex)
 
@@ -472,15 +400,13 @@ func runShard(ctx context.Context, client *modal.Client, app *modal.App, img *mo
 		logf("%s Starting (%d URLs)", prefix, len(urls))
 	}
 
-	// Create a long-running sandbox so we can write files, exec the search,
-	// and read results back via sb.Open — avoids stdout streaming truncation.
-	sb, err := client.Sandboxes.Create(ctx, app, img, &modal.SandboxCreateParams{
+	sb, err := client.Sandboxes.Create(ctx, app, img, &modalsdk.SandboxCreateParams{
 		Command:   []string{"sleep", "3600"},
-		CPU:       cfg.cpu,
-		MemoryMiB: cfg.memory,
-		Timeout:   cfg.timeout,
-		Cloud:     cfg.cloud,
-		Regions:   []string{cfg.region},
+		CPU:       cfg.CPU,
+		MemoryMiB: cfg.MemoryMiB,
+		Timeout:   cfg.Timeout,
+		Cloud:     cfg.Cloud,
+		Regions:   []string{cfg.Region},
 	})
 	if err != nil {
 		result.err = fmt.Errorf("creating sandbox: %w", err)
@@ -508,9 +434,9 @@ func runShard(ctx context.Context, client *modal.Client, app *modal.App, img *mo
 	// Run the search via sb.Exec
 	cmd := []string{
 		"/npi-rates", "search",
-		"--npi", cfg.npi,
+		"--npi", cfg.NPI,
 		"--urls-file", "/tmp/urls.txt",
-		"--workers", fmt.Sprintf("%d", cfg.workers),
+		"--workers", fmt.Sprintf("%d", cfg.WorkersPerShard),
 		"-o", "/tmp/results.json",
 		"--stream", "--log-progress",
 	}
@@ -626,24 +552,6 @@ func mergeResults(outputs [][]byte) (*mrf.SearchOutput, error) {
 	}
 
 	return &merged, nil
-}
-
-func readURLs(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var urls []string
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line != "" && !strings.HasPrefix(line, "#") {
-			urls = append(urls, line)
-		}
-	}
-	if len(urls) == 0 {
-		return nil, fmt.Errorf("no URLs found in %s", path)
-	}
-	return urls, nil
 }
 
 func logf(format string, args ...any) {

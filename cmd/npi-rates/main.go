@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gyeh/npi-rates/internal/cloud"
+	modalorch "github.com/gyeh/npi-rates/internal/modal"
 	"github.com/gyeh/npi-rates/internal/mrf"
 	"github.com/gyeh/npi-rates/internal/npi"
 	"github.com/gyeh/npi-rates/internal/output"
@@ -36,7 +36,6 @@ func main() {
 	rootCmd.AddCommand(newSearchCmd())
 	rootCmd.AddCommand(newDownloadCmd())
 	rootCmd.AddCommand(newSplitCmd())
-	rootCmd.AddCommand(newCloudSetupCmd())
 
 	if err := rootCmd.Execute(); err != nil {
 		os.Exit(1)
@@ -59,17 +58,16 @@ func newSearchCmd() *cobra.Command {
 		streamMode   bool
 		noSimd       bool
 
-		// Cloud mode flags (orchestrator)
-		cloudMode   bool
-		s3Bucket    string
-		region      string
-		subnets     []string
-		urlsPerTask int
-
-		// Worker mode flags (used by Fargate tasks)
-		urlsS3      string
-		outputS3    string
-		cloudRegion string
+		// Cloud mode flags (Modal orchestration)
+		cloudMode     bool
+		shards        int
+		cloudCPU      float64
+		cloudMemory   int
+		cloudTimeout  time.Duration
+		cloudProvider string
+		region        string
+		cloudImage    string
+		cloudWorkers  int
 	)
 
 	cmd := &cobra.Command{
@@ -114,25 +112,22 @@ func newSearchCmd() *cobra.Command {
 				os.Exit(1)
 			}()
 
-			// Look up NPI provider info (skip in worker mode — no user to display to)
-			if urlsS3 == "" {
-				if notFound := printProviderInfo(ctx, npis); len(notFound) > 0 {
-					if !confirmContinue(notFound) {
-						return fmt.Errorf("aborted: %d NPI(s) not found in NPPES registry", len(notFound))
-					}
+			// Default output filename with timestamp
+			if outputFile == "" {
+				outputFile = fmt.Sprintf("results_%s.json", time.Now().Format("20060102_150405"))
+			}
+
+			// Look up NPI provider info
+			if notFound := printProviderInfo(ctx, npis); len(notFound) > 0 {
+				if !confirmContinue(notFound) {
+					return fmt.Errorf("aborted: %d NPI(s) not found in NPPES registry", len(notFound))
 				}
 			}
 
-			// --- Cloud mode: distribute to Fargate ---
+			// --- Cloud mode: distribute to Modal sandboxes ---
 			if cloudMode {
 				if urlsFile == "" && len(urlsList) == 0 {
 					return fmt.Errorf("--urls-file or --url is required for cloud mode")
-				}
-				if s3Bucket == "" {
-					return fmt.Errorf("--s3-bucket is required for cloud mode")
-				}
-				if len(subnets) == 0 {
-					return fmt.Errorf("--subnets is required for cloud mode")
 				}
 
 				var urls []string
@@ -149,44 +144,32 @@ func newSearchCmd() *cobra.Command {
 					return fmt.Errorf("no URLs provided")
 				}
 
-				return cloud.RunCloudSearch(ctx, cloud.CloudSearchConfig{
-					URLs:        urls,
-					NPIs:        npis,
-					OutputFile:  outputFile,
-					S3Bucket:    s3Bucket,
-					Region:      region,
-					Subnets:     subnets,
-					URLsPerTask: urlsPerTask,
+				npiStrs := make([]string, len(npis))
+				for i, n := range npis {
+					npiStrs[i] = fmt.Sprintf("%d", n)
+				}
+
+				return modalorch.RunSearch(ctx, modalorch.Config{
+					NPI:             strings.Join(npiStrs, ","),
+					URLs:            urls,
+					OutputFile:      outputFile,
+					Shards:          shards,
+					WorkersPerShard: cloudWorkers,
+					CPU:             cloudCPU,
+					MemoryMiB:       cloudMemory,
+					Timeout:         cloudTimeout,
+					Cloud:           cloudProvider,
+					Region:          region,
+					Image:           cloudImage,
+					Progress:        !noProgress && isTerminal(),
 				})
 			}
 
-			// --- Read URLs from file, S3, or command-line ---
+			// --- Read URLs from file or command-line ---
 			var urls []string
-			if urlsS3 != "" {
-				// Worker mode: download URL file from S3
-				bucket, key, parseErr := cloud.ParseS3URI(urlsS3)
-				if parseErr != nil {
-					return fmt.Errorf("parsing --urls-s3: %w", parseErr)
-				}
-				s3Client, s3Err := cloud.NewS3Client(ctx, bucket, cloudRegion)
-				if s3Err != nil {
-					return fmt.Errorf("creating S3 client: %w", s3Err)
-				}
-				data, dlErr := s3Client.DownloadBytes(ctx, key)
-				if dlErr != nil {
-					return fmt.Errorf("downloading URLs from S3: %w", dlErr)
-				}
-				for _, line := range strings.Split(string(data), "\n") {
-					line = strings.TrimSpace(line)
-					if line == "" || strings.HasPrefix(line, "#") {
-						continue
-					}
-					urls = append(urls, line)
-				}
-			} else if len(urlsList) > 0 {
+			if len(urlsList) > 0 {
 				urls = urlsList
 			} else if urlsFile != "" {
-				// Local mode or Cloud orchestration mode
 				var readErr error
 				urls, readErr = readURLs(urlsFile)
 				if readErr != nil {
@@ -291,35 +274,6 @@ func newSearchCmd() *cobra.Command {
 				len(urls), matchedFiles, len(allRates), duration.Seconds())
 			fmt.Fprintf(os.Stderr, "Results written to %s\n", outputFile)
 
-			// Upload results to S3 if in worker mode
-			if outputS3 != "" {
-				bucket, key, parseErr := cloud.ParseS3URI(outputS3)
-				if parseErr != nil {
-					return fmt.Errorf("parsing --output-s3: %w", parseErr)
-				}
-
-				searchOut := mrf.SearchOutput{
-					SearchParams: params,
-					Results:      allRates,
-				}
-				if searchOut.Results == nil {
-					searchOut.Results = []mrf.RateResult{}
-				}
-				data, jsonErr := json.Marshal(searchOut)
-				if jsonErr != nil {
-					return fmt.Errorf("marshaling results for S3: %w", jsonErr)
-				}
-
-				s3Client, s3Err := cloud.NewS3Client(ctx, bucket, cloudRegion)
-				if s3Err != nil {
-					return fmt.Errorf("creating S3 client for upload: %w", s3Err)
-				}
-				if uploadErr := s3Client.UploadBytes(ctx, key, data, "application/json"); uploadErr != nil {
-					return fmt.Errorf("uploading results to S3: %w", uploadErr)
-				}
-				fmt.Fprintf(os.Stderr, "Results uploaded to s3://%s/%s\n", bucket, key)
-			}
-
 			return nil
 		},
 	}
@@ -330,7 +284,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().StringVar(&npiList, "npi", "", "Comma-separated NPI numbers to search for")
 	cmd.Flags().StringVar(&providerName, "provider-name", "", "Search by provider name (\"First Last\")")
 	cmd.Flags().StringVar(&state, "state", "", "State filter for provider name search (2-letter code, e.g. NY)")
-	cmd.Flags().StringVarP(&outputFile, "output", "o", "results.json", "Output file path (use '-' for stdout)")
+	cmd.Flags().StringVarP(&outputFile, "output", "o", "", "Output file path (default: results_<timestamp>.json, use '-' for stdout)")
 	cmd.Flags().IntVar(&workers, "workers", 3, "Number of concurrent file workers")
 	cmd.Flags().StringVar(&tmpDir, "tmp-dir", "", "Temp directory for intermediate files (default: system temp)")
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress bars")
@@ -339,20 +293,16 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&streamMode, "stream", true, "Stream directly from download to parsing (no disk, constant memory)")
 	cmd.Flags().BoolVar(&noSimd, "no-simd", false, "Disable simdjson and use stdlib encoding/json")
 
-	// Cloud mode flags (orchestrator)
-	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Fargate)")
-	cmd.Flags().StringVar(&s3Bucket, "s3-bucket", "", "S3 bucket for URL chunks and results (cloud mode)")
-	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region (cloud mode)")
-	cmd.Flags().StringSliceVar(&subnets, "subnets", nil, "VPC subnet IDs for Fargate tasks (cloud mode)")
-	cmd.Flags().IntVar(&urlsPerTask, "urls-per-task", 5, "Number of URLs per Fargate task (cloud mode)")
-
-	// Worker mode flags (used by Fargate containers, hidden)
-	cmd.Flags().StringVar(&urlsS3, "urls-s3", "", "S3 URI for URL file (worker mode)")
-	cmd.Flags().StringVar(&outputS3, "output-s3", "", "S3 URI to upload results to (worker mode)")
-	cmd.Flags().StringVar(&cloudRegion, "cloud-region", "us-east-1", "AWS region for S3 operations (worker mode)")
-	cmd.Flags().MarkHidden("urls-s3")
-	cmd.Flags().MarkHidden("output-s3")
-	cmd.Flags().MarkHidden("cloud-region")
+	// Cloud mode flags (Modal orchestration)
+	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Modal sandboxes)")
+	cmd.Flags().IntVar(&shards, "shards", 100, "Number of URL shards (cloud mode)")
+	cmd.Flags().Float64Var(&cloudCPU, "cloud-cpu", 2.0, "CPU cores per sandbox (cloud mode)")
+	cmd.Flags().IntVar(&cloudMemory, "cloud-memory", 4096, "Memory MB per sandbox (cloud mode)")
+	cmd.Flags().DurationVar(&cloudTimeout, "cloud-timeout", time.Hour, "Timeout per sandbox (cloud mode)")
+	cmd.Flags().StringVar(&cloudProvider, "cloud-provider", "aws", "Cloud provider for sandboxes: aws, gcp (cloud mode)")
+	cmd.Flags().StringVar(&region, "region", "us-east-1", "Region for sandboxes (cloud mode)")
+	cmd.Flags().StringVar(&cloudImage, "cloud-image", "", "Pre-built Docker image, skip cross-compile (cloud mode)")
+	cmd.Flags().IntVar(&cloudWorkers, "cloud-workers", 1, "Workers per shard (cloud mode)")
 
 	return cmd
 }
@@ -496,30 +446,6 @@ func newSplitCmd() *cobra.Command {
 	}
 
 	cmd.Flags().StringVarP(&outputDir, "output-dir", "o", "", "Output directory for split files (default: <input>_split)")
-
-	return cmd
-}
-
-func newCloudSetupCmd() *cobra.Command {
-	var (
-		region   string
-		s3Bucket string
-	)
-
-	cmd := &cobra.Command{
-		Use:   "cloud-setup",
-		Short: "Provision AWS infrastructure for Fargate-based distributed processing",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return cloud.Setup(context.Background(), cloud.SetupConfig{
-				Region:   region,
-				S3Bucket: s3Bucket,
-			})
-		},
-	}
-
-	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
-	cmd.Flags().StringVar(&s3Bucket, "s3-bucket", "", "S3 bucket for results")
-	cmd.MarkFlagRequired("s3-bucket")
 
 	return cmd
 }
@@ -910,6 +836,15 @@ func fetchFileSizes(ctx context.Context, urls []string) []int64 {
 	}
 	wg.Wait()
 	return sizes
+}
+
+// isTerminal returns true if stderr is connected to a terminal.
+func isTerminal() bool {
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
 }
 
 func humanBytesCLI(b uint64) string {
