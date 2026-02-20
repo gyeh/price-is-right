@@ -90,7 +90,8 @@ func (t *logTracker) log(msg string) {
 	if t.mgr.taskID != "" {
 		prefix = fmt.Sprintf("[ID|%s] ", t.mgr.taskID)
 	}
-	fmt.Fprintf(os.Stderr, "%s %s[URL|%d/%d] [%s]  %s\n", ts, prefix, t.mgr.completed, t.total, t.name, msg)
+	w := len(fmt.Sprintf("%d", t.total))
+	fmt.Fprintf(os.Stderr, "%s %s[URL|%*d/%d] [%s]  %s\n", ts, prefix, w, t.mgr.completed, t.total, t.name, msg)
 }
 
 func (t *logTracker) SetStage(stage string) {

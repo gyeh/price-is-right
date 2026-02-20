@@ -7,12 +7,24 @@ Usage:
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
 from datetime import datetime
 
 import modal
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    task_id = os.environ.get("MODAL_TASK_ID", "")
+    if not task_id:
+        import socket
+        task_id = socket.gethostname()
+    task_id = task_id[-8:]
+    prefix = f"[ID|{task_id}] " if task_id else ""
+    print(f"{ts} {prefix}{msg}", file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -30,8 +42,8 @@ def _cli_arg(name, default, type_fn=str):
     return default
 
 
-_CPU = _cli_arg("cpu", 4, int)
-_MEMORY = _cli_arg("memory", 8192   , int)
+_CPU = _cli_arg("cpu", 2, int)
+_MEMORY = _cli_arg("memory", 4096   , int)
 _TIMEOUT = _cli_arg("timeout", 3600, int)
 _CLOUD = _cli_arg("cloud", "aws")
 _REGION = _cli_arg("region", "us-east-1")
@@ -96,7 +108,7 @@ def run_search(shard_index: int, urls: list[str], npi: str, workers: int):
 
 def cleanup_volume(name: str):
     """Delete the remote Modal volume."""
-    print("Cleaning up remote volume...")
+    log("Cleaning up remote volume...")
     subprocess.run(
         [sys.executable, "-m", "modal", "volume", "delete", name, "--yes"],
         capture_output=True,
@@ -164,11 +176,10 @@ def main(
     urls = read_urls(urls_file)
     url_shards = shard_urls(urls, shards)
 
-    print(f"NPI: {npi}")
-    print(f"Files: {len(urls)} URLs across {len(url_shards)} shards")
-    print(f"Infra: {_CPU} CPU, {_MEMORY} MB memory, {_CLOUD}/{_REGION}")
-    print(f"Workers per shard: {workers}")
-    print()
+    log(f"NPI: {npi}")
+    log(f"Files: {len(urls)} URLs across {len(url_shards)} shards")
+    log(f"Infra: {_CPU} CPU, {_MEMORY} MB memory, {_CLOUD}/{_REGION}")
+    log(f"Workers per shard: {workers}")
 
     start = time.time()
 
@@ -177,7 +188,7 @@ def main(
             [(i, shard, npi, workers) for i, shard in enumerate(url_shards)]
         ))
     except Exception as e:
-        print(f"\nSearch failed: {e}", file=sys.stderr)
+        log(f"Search failed: {e}")
         cleanup_volume(_VOLUME_NAME)
         sys.exit(1)
 
@@ -194,8 +205,8 @@ def main(
     count = len(merged["results"])
     searched = merged["search_params"]["searched_files"]
     matched = merged["search_params"]["matched_files"]
-    print(f"\nSearch complete: {searched} files searched, {matched} matched, {count} rates found in {wall_time:.1f}s")
-    print(f"Results saved to {output_path}")
+    log(f"Search complete: {searched} files searched, {matched} matched, {count} rates found in {wall_time:.1f}s")
+    log(f"Results saved to {output_path}")
 
-    cleanup_volume(volume_name)
-    print("Done.")
+    cleanup_volume(_VOLUME_NAME)
+    log("Function run completed")
