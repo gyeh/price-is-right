@@ -75,8 +75,9 @@ func runPipelineStreaming(
 		func(r mrf.RateResult) {
 			mu.Lock()
 			result.Results = append(result.Results, r)
+			n := int64(len(result.Results))
 			mu.Unlock()
-			tracker.SetCounter("rates_found", int64(len(result.Results)))
+			tracker.SetCounter("rates_found", n)
 		},
 	)
 	if err != nil {

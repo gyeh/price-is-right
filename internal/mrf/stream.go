@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"runtime"
+	"sync"
 
 	simdjson "github.com/minio/simdjson-go"
 )
@@ -177,8 +179,10 @@ func streamProviderReferences(
 	return pj, nil
 }
 
-// streamInNetwork reads the in_network JSON array element by element,
-// checking each for NPI matches and emitting results. Returns the (possibly reused) ParsedJson.
+// streamInNetwork reads the in_network JSON array element by element.
+// Decoding is serial (json.Decoder requires it), but simdjson matching and
+// stdlib unmarshalling are fanned out to GOMAXPROCS workers for parallel
+// processing. Each worker holds its own *simdjson.ParsedJson.
 func streamInNetwork(
 	dec *json.Decoder,
 	targetNPIs map[int64]struct{},
@@ -197,50 +201,86 @@ func streamInNetwork(
 		return pj, fmt.Errorf("expected '[', got %v", tok)
 	}
 
+	// Fan out element processing to workers.
+	numWorkers := runtime.GOMAXPROCS(0)
+	ch := make(chan json.RawMessage, numWorkers*2)
+
+	var wg sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var workerPJ *simdjson.ParsedJson
+			for raw := range ch {
+				processInNetworkElement(raw, targetNPIs, matched, sourceFile, &workerPJ, emit)
+			}
+		}()
+	}
+
+	// Decode loop — serial, feeds workers via channel.
+	var decErr error
 	for dec.More() {
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
-			return pj, fmt.Errorf("decoding element: %w", err)
+			decErr = fmt.Errorf("decoding element: %w", err)
+			break
 		}
 
 		if onCodeScanned != nil {
 			onCodeScanned()
 		}
 
-		if useSimd {
-			// Quick match check with simdjson.
-			pj, err = simdjson.Parse(raw, pj)
-			if err != nil {
-				continue
-			}
-			isMatch := false
-			pj.ForEach(func(i simdjson.Iter) error {
-				isMatch = checkNPIMatchSimd(i, targetNPIs, matched)
-				return nil
-			})
-			if !isMatch {
-				continue
-			}
-		}
+		ch <- raw
+	}
+	close(ch)
+	wg.Wait()
 
-		// Full extraction via stdlib (simdjson matched or no simdjson).
-		var item InNetworkItem
-		if err := json.Unmarshal(raw, &item); err != nil {
-			continue
-		}
-
-		// When not using simdjson, we need to check if this item has any matches
-		// before emitting. emitInNetworkResults handles the matching logic.
-		emitInNetworkResults(&item, targetNPIs, matched, sourceFile, emit)
+	if decErr != nil {
+		return nil, decErr
 	}
 
 	// Expect closing ']'.
 	tok, err = dec.Token()
 	if err != nil {
-		return pj, fmt.Errorf("reading array end: %w", err)
+		return nil, fmt.Errorf("reading array end: %w", err)
 	}
 
-	return pj, nil
+	return nil, nil
+}
+
+// processInNetworkElement checks a single in_network element for NPI matches
+// and emits results. Called from worker goroutines — targetNPIs and matched
+// are read-only at this point; emit must be safe for concurrent calls.
+func processInNetworkElement(
+	raw json.RawMessage,
+	targetNPIs map[int64]struct{},
+	matched *MatchedProviders,
+	sourceFile string,
+	pj **simdjson.ParsedJson,
+	emit func(RateResult),
+) {
+	if useSimd {
+		var err error
+		*pj, err = simdjson.Parse(raw, *pj)
+		if err != nil {
+			return
+		}
+		isMatch := false
+		(*pj).ForEach(func(i simdjson.Iter) error {
+			isMatch = checkNPIMatchSimd(i, targetNPIs, matched)
+			return nil
+		})
+		if !isMatch {
+			return
+		}
+	}
+
+	var item InNetworkItem
+	if err := json.Unmarshal(raw, &item); err != nil {
+		return
+	}
+
+	emitInNetworkResults(&item, targetNPIs, matched, sourceFile, emit)
 }
 
 // skipValue reads and discards the next JSON value from the decoder.
