@@ -336,7 +336,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress bars")
 	cmd.Flags().BoolVar(&logProgress, "log-progress", false, "Use line-based progress logging (for non-TTY environments)")
 	cmd.Flags().BoolVar(&noFIFO, "no-fifo", false, "Use file-based pipeline instead of FIFO streaming")
-	cmd.Flags().BoolVar(&streamMode, "stream", false, "Stream directly from download to parsing (no disk, constant memory)")
+	cmd.Flags().BoolVar(&streamMode, "stream", true, "Stream directly from download to parsing (no disk, constant memory)")
 	cmd.Flags().BoolVar(&noSimd, "no-simd", false, "Disable simdjson and use stdlib encoding/json")
 
 	// Cloud mode flags (orchestrator)
