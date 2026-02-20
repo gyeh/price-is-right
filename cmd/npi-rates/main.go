@@ -124,26 +124,26 @@ func newSearchCmd() *cobra.Command {
 				}
 			}
 
+			// --- Read URLs from file or command-line ---
+			var urls []string
+			if len(urlsList) > 0 {
+				urls = urlsList
+			} else if urlsFile != "" {
+				var readErr error
+				urls, readErr = readURLs(urlsFile)
+				if readErr != nil {
+					return fmt.Errorf("reading URLs: %w", readErr)
+				}
+			} else {
+				return fmt.Errorf("either --urls-file or --url is required")
+			}
+			if len(urls) == 0 {
+				return fmt.Errorf("no URLs found")
+			}
+			logURLInfo(ctx, urls)
+
 			// --- Cloud mode: distribute to Modal sandboxes ---
 			if cloudMode {
-				if urlsFile == "" && len(urlsList) == 0 {
-					return fmt.Errorf("--urls-file or --url is required for cloud mode")
-				}
-
-				var urls []string
-				if len(urlsList) > 0 {
-					urls = urlsList
-				} else {
-					var readErr error
-					urls, readErr = readURLs(urlsFile)
-					if readErr != nil {
-						return fmt.Errorf("reading URLs: %w", readErr)
-					}
-				}
-				if len(urls) == 0 {
-					return fmt.Errorf("no URLs provided")
-				}
-
 				npiStrs := make([]string, len(npis))
 				for i, n := range npis {
 					npiStrs[i] = fmt.Sprintf("%d", n)
@@ -163,23 +163,6 @@ func newSearchCmd() *cobra.Command {
 					Image:           cloudImage,
 					Progress:        !noProgress && isTerminal(),
 				})
-			}
-
-			// --- Read URLs from file or command-line ---
-			var urls []string
-			if len(urlsList) > 0 {
-				urls = urlsList
-			} else if urlsFile != "" {
-				var readErr error
-				urls, readErr = readURLs(urlsFile)
-				if readErr != nil {
-					return fmt.Errorf("reading URLs: %w", readErr)
-				}
-			} else {
-				return fmt.Errorf("either --urls-file or --url is required")
-			}
-			if len(urls) == 0 {
-				return fmt.Errorf("no URLs found")
 			}
 
 			// Build NPI lookup set
@@ -218,7 +201,6 @@ func newSearchCmd() *cobra.Command {
 			}
 
 			// Log URL and environment info
-			logURLInfo(ctx, urls)
 			fmt.Fprintf(os.Stderr, "Parser: %s\n", mrf.ParserName())
 			if streamMode {
 				fmt.Fprintf(os.Stderr, "Mode: streaming (no disk)\n")
