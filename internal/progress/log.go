@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -35,43 +34,9 @@ func (m *LogManager) Wait() {}
 
 func (m *LogManager) SetOverallStats(filesComplete, filesMatched int, totalRates int64) {}
 
-func (m *LogManager) StartDiskMonitor(tmpDir string) {
-	m.diskStop = make(chan struct{})
+func (m *LogManager) StartDiskMonitor(tmpDir string) {}
 
-	var baselineUsed uint64
-	var stat0 syscall.Statfs_t
-	if syscall.Statfs(tmpDir, &stat0) == nil {
-		baselineUsed = (stat0.Blocks - stat0.Bavail) * uint64(stat0.Bsize)
-	}
-
-	go func() {
-		ticker := time.NewTicker(60 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				var stat syscall.Statfs_t
-				if err := syscall.Statfs(tmpDir, &stat); err == nil {
-					avail := stat.Bavail * uint64(stat.Bsize)
-					used := (stat.Blocks - stat.Bavail) * uint64(stat.Bsize)
-					delta := uint64(0)
-					if used > baselineUsed {
-						delta = used - baselineUsed
-					}
-					m.log(fmt.Sprintf("Disk: %s used, %s free", humanBytesUint(delta), humanBytesUint(avail)))
-				}
-			case <-m.diskStop:
-				return
-			}
-		}
-	}()
-}
-
-func (m *LogManager) StopDiskMonitor() {
-	if m.diskStop != nil {
-		close(m.diskStop)
-	}
-}
+func (m *LogManager) StopDiskMonitor() {}
 
 func (m *LogManager) log(msg string) {
 	m.mu.Lock()
@@ -82,18 +47,18 @@ func (m *LogManager) log(msg string) {
 
 // logTracker implements Tracker with throttled log output.
 type logTracker struct {
-	mgr      *LogManager
-	index    int
-	total    int
-	name     string
-	start    time.Time
-	stage    string
-	lastLog  time.Time
+	mgr       *LogManager
+	index     int
+	total     int
+	name      string
+	start     time.Time
+	stage     string
+	lastLog   time.Time
 	prevBytes int64
 	prevTime  time.Time
 }
 
-const logInterval = 10 * time.Second
+const logInterval = 20 * time.Second
 
 func (t *logTracker) log(msg string) {
 	t.mgr.mu.Lock()

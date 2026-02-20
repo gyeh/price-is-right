@@ -32,9 +32,11 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 @app.function(
     image=image,
     cpu=8,
-    memory=16384,  # 16 GB
+    memory=16384,
     volumes={"/data": volume},
-    timeout=7200  # 2 hours
+    timeout=7200,  # 2 hours
+    cloud="aws",
+    region="us-east-1"
 )
 def run_search(shard_index: int, urls: list[str]):
     import os
@@ -59,6 +61,7 @@ def run_search(shard_index: int, urls: list[str]):
             "--urls-file", urls_path,
             "--workers", "8",
             "--log-progress",
+            "--no-fifo",
             "--tmp-dir", tmp_dir,
             "-o", output_path,
         ],
