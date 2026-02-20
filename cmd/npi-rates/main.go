@@ -43,7 +43,8 @@ func main() {
 
 func newSearchCmd() *cobra.Command {
 	var (
-		urlsFile     string // Used during Cloud mode or local mode
+		urlsFile     string   // Used during Cloud mode or local mode
+		urlsList     []string // URLs passed directly on the command line
 		npiList      string
 		providerName string
 		state        string
@@ -114,8 +115,8 @@ func newSearchCmd() *cobra.Command {
 
 			// --- Cloud mode: distribute to Fargate ---
 			if cloudMode {
-				if urlsFile == "" {
-					return fmt.Errorf("--urls-file is required for cloud mode")
+				if urlsFile == "" && len(urlsList) == 0 {
+					return fmt.Errorf("--urls-file or --url is required for cloud mode")
 				}
 				if s3Bucket == "" {
 					return fmt.Errorf("--s3-bucket is required for cloud mode")
@@ -124,12 +125,18 @@ func newSearchCmd() *cobra.Command {
 					return fmt.Errorf("--subnets is required for cloud mode")
 				}
 
-				urls, readErr := readURLs(urlsFile)
-				if readErr != nil {
-					return fmt.Errorf("reading URLs: %w", readErr)
+				var urls []string
+				if len(urlsList) > 0 {
+					urls = urlsList
+				} else {
+					var readErr error
+					urls, readErr = readURLs(urlsFile)
+					if readErr != nil {
+						return fmt.Errorf("reading URLs: %w", readErr)
+					}
 				}
 				if len(urls) == 0 {
-					return fmt.Errorf("no URLs found in %s", urlsFile)
+					return fmt.Errorf("no URLs provided")
 				}
 
 				return cloud.RunCloudSearch(ctx, cloud.CloudSearchConfig{
@@ -143,7 +150,7 @@ func newSearchCmd() *cobra.Command {
 				})
 			}
 
-			// --- Read URLs from file or S3 ---
+			// --- Read URLs from file, S3, or command-line ---
 			var urls []string
 			if urlsS3 != "" {
 				// Worker mode: download URL file from S3
@@ -166,6 +173,8 @@ func newSearchCmd() *cobra.Command {
 					}
 					urls = append(urls, line)
 				}
+			} else if len(urlsList) > 0 {
+				urls = urlsList
 			} else if urlsFile != "" {
 				// Local mode or Cloud orchestration mode
 				var readErr error
@@ -174,7 +183,7 @@ func newSearchCmd() *cobra.Command {
 					return fmt.Errorf("reading URLs: %w", readErr)
 				}
 			} else {
-				return fmt.Errorf("either --urls-file or --urls-s3 is required")
+				return fmt.Errorf("either --urls-file or --url is required")
 			}
 			if len(urls) == 0 {
 				return fmt.Errorf("no URLs found")
@@ -296,6 +305,7 @@ func newSearchCmd() *cobra.Command {
 
 	// Standard flags
 	cmd.Flags().StringVar(&urlsFile, "urls-file", "", "File containing MRF URLs (one per line)")
+	cmd.Flags().StringSliceVar(&urlsList, "url", nil, "MRF URL(s) to search (can be repeated or comma-separated)")
 	cmd.Flags().StringVar(&npiList, "npi", "", "Comma-separated NPI numbers to search for")
 	cmd.Flags().StringVar(&providerName, "provider-name", "", "Search by provider name (\"First Last\")")
 	cmd.Flags().StringVar(&state, "state", "", "State filter for provider name search (2-letter code, e.g. NY)")
