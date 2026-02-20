@@ -25,9 +25,9 @@ func NewLogManager() *LogManager {
 		// Fallback: hostname (useful for Fargate/other cloud environments)
 		taskID, _ = os.Hostname()
 	}
-	// Truncate to last 8 chars for readability
-	if len(taskID) > 8 {
-		taskID = taskID[len(taskID)-8:]
+	// Truncate to last 26 chars for readability
+	if len(taskID) > 30 {
+		taskID = taskID[len(taskID)-30:]
 	}
 	return &LogManager{taskID: taskID}
 }

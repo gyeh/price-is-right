@@ -14,6 +14,11 @@ import (
 // useSimd is true if the CPU supports AVX2+CLMUL for simdjson acceleration.
 var useSimd = simdjson.SupportedCPU()
 
+// DisableSimd forces the stdlib JSON parser even on CPUs that support simdjson.
+func DisableSimd() {
+	useSimd = false
+}
+
 // ParserName returns which JSON parser is active.
 func ParserName() string {
 	if useSimd {

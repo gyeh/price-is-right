@@ -181,6 +181,7 @@ func TestPipelineEndToEnd(t *testing.T) {
 		url,
 		targetNPIs,
 		tmpDir,
+		false, false,
 		tracker.NewTracker(0, 1, "test-mrf.json.gz"),
 	)
 
@@ -309,6 +310,7 @@ func TestPipelineEndToEnd_NoMatch(t *testing.T) {
 		url,
 		targetNPIs,
 		tmpDir,
+		false, false,
 		tracker.NewTracker(0, 1, "test-mrf.json.gz"),
 	)
 
@@ -341,6 +343,7 @@ func TestPipelineEndToEnd_MultipleNPIs(t *testing.T) {
 		url,
 		targetNPIs,
 		tmpDir,
+		false, false,
 		tracker.NewTracker(0, 1, "test-mrf.json.gz"),
 	)
 
@@ -455,6 +458,7 @@ func TestPipelineEndToEnd_ContextCancellation(t *testing.T) {
 		url,
 		targetNPIs,
 		tmpDir,
+		false, false,
 		tracker.NewTracker(0, 1, "slow.json.gz"),
 	)
 
@@ -518,6 +522,7 @@ func TestPipelineEndToEnd_FloatProviderGroupID(t *testing.T) {
 		url,
 		targetNPIs,
 		tmpDir,
+		false, false,
 		tracker.NewTracker(0, 1, "float-test.json.gz"),
 	)
 
@@ -563,6 +568,7 @@ func TestPipelineEndToEnd_ServiceCodeAndModifiers(t *testing.T) {
 		url,
 		targetNPIs,
 		tmpDir,
+		false, false,
 		tracker.NewTracker(0, 1, "test-mrf.json.gz"),
 	)
 
@@ -586,5 +592,162 @@ func TestPipelineEndToEnd_ServiceCodeAndModifiers(t *testing.T) {
 		}
 	}
 	t.Error("99213 institutional result not found")
+}
+
+// TestStreamPipelineEndToEnd exercises the streaming pipeline (--stream mode):
+// HTTP download → gzip decompress → json.Decoder streaming → rate results.
+// This should produce identical results to the non-streaming pipeline.
+func TestStreamPipelineEndToEnd(t *testing.T) {
+	mrfJSON := buildTestMRF()
+	server := serveGzippedMRF(t, mrfJSON)
+	defer server.Close()
+
+	url := server.URL + "/test-mrf.json.gz"
+	targetNPIs := map[int64]struct{}{1316924913: {}}
+	tmpDir := t.TempDir()
+	tracker := &progress.NoopManager{}
+
+	result := RunPipeline(
+		context.Background(),
+		url,
+		targetNPIs,
+		tmpDir,
+		false, true, // stream=true
+		tracker.NewTracker(0, 1, "test-mrf.json.gz"),
+	)
+
+	if result.Err != nil {
+		t.Fatalf("streaming pipeline failed: %v", result.Err)
+	}
+
+	// Same expected results as TestPipelineEndToEnd: 4 results
+	if len(result.Results) != 4 {
+		for i, r := range result.Results {
+			t.Logf("  result[%d]: code=%s rate=%.2f NPI=%d TIN=%s", i, r.BillingCode, r.NegotiatedRate, r.NPI, r.TIN.Value)
+		}
+		t.Fatalf("expected 4 results, got %d", len(result.Results))
+	}
+
+	resultsByCode := map[string][]mrf.RateResult{}
+	for _, r := range result.Results {
+		resultsByCode[r.BillingCode] = append(resultsByCode[r.BillingCode], r)
+	}
+
+	// 99213: 2 prices via provider_references
+	if rates := resultsByCode["99213"]; len(rates) != 2 {
+		t.Errorf("expected 2 results for 99213, got %d", len(rates))
+	}
+
+	// 99214: should NOT appear
+	if rates := resultsByCode["99214"]; len(rates) != 0 {
+		t.Errorf("expected 0 results for 99214, got %d", len(rates))
+	}
+
+	// J0129: 1 result via provider_references
+	if rates := resultsByCode["J0129"]; len(rates) != 1 {
+		t.Errorf("expected 1 result for J0129, got %d", len(rates))
+	}
+
+	// 36415: 1 result via inline provider_groups
+	if rates := resultsByCode["36415"]; len(rates) != 1 {
+		t.Errorf("expected 1 result for 36415, got %d", len(rates))
+	}
+}
+
+// TestStreamPipelineEndToEnd_NoMatch verifies the streaming pipeline returns
+// zero results when no NPIs match.
+func TestStreamPipelineEndToEnd_NoMatch(t *testing.T) {
+	mrfJSON := buildTestMRF()
+	server := serveGzippedMRF(t, mrfJSON)
+	defer server.Close()
+
+	url := server.URL + "/test-mrf.json.gz"
+	targetNPIs := map[int64]struct{}{1111111111: {}}
+	tmpDir := t.TempDir()
+	tracker := &progress.NoopManager{}
+
+	result := RunPipeline(
+		context.Background(),
+		url,
+		targetNPIs,
+		tmpDir,
+		false, true,
+		tracker.NewTracker(0, 1, "test-mrf.json.gz"),
+	)
+
+	if result.Err != nil {
+		t.Fatalf("streaming pipeline failed: %v", result.Err)
+	}
+	if len(result.Results) != 0 {
+		t.Errorf("expected 0 results, got %d", len(result.Results))
+	}
+}
+
+// TestStreamPipelineEndToEnd_FloatIDs validates that streaming mode correctly
+// distinguishes float provider_group_ids.
+func TestStreamPipelineEndToEnd_FloatIDs(t *testing.T) {
+	mrfJSON := `{
+	"reporting_entity_name": "Float ID Test",
+	"provider_references": [
+		{
+			"provider_group_id": 42.123456789,
+			"provider_groups": [{"npi": [1234567890], "tin": {"type": "ein", "value": "12-3456789"}}]
+		},
+		{
+			"provider_group_id": 42.987654321,
+			"provider_groups": [{"npi": [9876543210], "tin": {"type": "ein", "value": "98-7654321"}}]
+		}
+	],
+	"in_network": [
+		{
+			"billing_code_type": "CPT", "billing_code": "99213",
+			"name": "Test code A", "negotiation_arrangement": "ffs",
+			"negotiated_rates": [{
+				"provider_references": [42.123456789],
+				"negotiated_prices": [{"negotiated_rate": 100.00, "negotiated_type": "negotiated", "billing_class": "professional", "setting": "outpatient", "expiration_date": "2025-12-31"}]
+			}]
+		},
+		{
+			"billing_code_type": "CPT", "billing_code": "99214",
+			"name": "Test code B", "negotiation_arrangement": "ffs",
+			"negotiated_rates": [{
+				"provider_references": [42.987654321],
+				"negotiated_prices": [{"negotiated_rate": 200.00, "negotiated_type": "negotiated", "billing_class": "professional", "setting": "outpatient", "expiration_date": "2025-12-31"}]
+			}]
+		}
+	]
+}`
+
+	server := serveGzippedMRF(t, mrfJSON)
+	defer server.Close()
+
+	url := server.URL + "/float-test.json.gz"
+	targetNPIs := map[int64]struct{}{1234567890: {}}
+	tmpDir := t.TempDir()
+	tracker := &progress.NoopManager{}
+
+	result := RunPipeline(
+		context.Background(),
+		url,
+		targetNPIs,
+		tmpDir,
+		false, true,
+		tracker.NewTracker(0, 1, "float-test.json.gz"),
+	)
+
+	if result.Err != nil {
+		t.Fatalf("streaming pipeline failed: %v", result.Err)
+	}
+
+	if len(result.Results) != 1 {
+		for i, r := range result.Results {
+			t.Logf("  result[%d]: code=%s rate=%.2f", i, r.BillingCode, r.NegotiatedRate)
+		}
+		t.Fatalf("expected 1 result, got %d", len(result.Results))
+	}
+
+	if result.Results[0].BillingCode != "99213" {
+		t.Errorf("expected billing code 99213, got %s", result.Results[0].BillingCode)
+	}
 }
 

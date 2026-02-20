@@ -16,6 +16,11 @@ import (
 	"github.com/gyeh/npi-rates/internal/progress"
 )
 
+// splitMu limits concurrent jsplit operations to 1. jsplit's ParseObject uses a
+// global, non-thread-safe buffer (parseObjBuffer) and can hold hundreds of MB per
+// object in memory. Serializing splits avoids both the race and memory blow-up.
+var splitMu sync.Mutex
+
 // PipelineResult holds results from processing a single MRF file.
 type PipelineResult struct {
 	URL     string
@@ -41,8 +46,39 @@ func RunPipeline(
 	targetNPIs map[int64]struct{},
 	tmpDir string,
 	noFIFO bool,
+	stream bool,
 	tracker progress.Tracker,
 ) *PipelineResult {
+	// Streaming mode: skip all disk operations, pipe HTTP → gzip → parser directly.
+	if stream {
+		var lastErr error
+		for attempt := 1; attempt <= maxPipelineRetries; attempt++ {
+			if ctx.Err() != nil {
+				return &PipelineResult{URL: url, Err: ctx.Err()}
+			}
+			useStdGzip := attempt > 1
+			result := runPipelineStreaming(ctx, url, targetNPIs, useStdGzip, tracker)
+			if result.Err == nil {
+				return result
+			}
+			lastErr = result.Err
+			if ctx.Err() != nil {
+				return result
+			}
+			if attempt < maxPipelineRetries {
+				tracker.LogWarning(fmt.Sprintf("Attempt %d/%d failed: %v", attempt, maxPipelineRetries, lastErr))
+				delay := time.Duration(attempt) * 2 * time.Second
+				tracker.SetStage(fmt.Sprintf("Retry %d/%d (waiting %s)", attempt+1, maxPipelineRetries, delay))
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return &PipelineResult{URL: url, Err: ctx.Err()}
+				}
+			}
+		}
+		return &PipelineResult{URL: url, Err: lastErr}
+	}
+
 	// Check if FIFOs are supported (they aren't on all platforms)
 	fifoSupported := false
 	if !noFIFO {
@@ -131,6 +167,13 @@ func runPipelineWithFIFO(
 		return result
 	}
 	defer os.Remove(fifoPath)
+
+	// Acquire split lock — only one jsplit at a time (see splitMu comment).
+	// For FIFO mode, the download and split are coupled, so hold the lock
+	// for the entire download+split duration.
+	tracker.SetStage("Waiting for split slot")
+	splitMu.Lock()
+	defer splitMu.Unlock()
 
 	stage := "Downloading + Splitting"
 	if useStdGzip {
@@ -223,10 +266,16 @@ func runPipelineWithFile(
 	// Get decompressed file size for split progress tracking
 	inputSize := fileSize(dlResult.FilePath)
 
+	// Acquire split lock — only one jsplit at a time (see splitMu comment).
+	tracker.SetStage("Waiting for split slot")
+	splitMu.Lock()
+
 	tracker.SetStage("Splitting")
 	stopProgress := pollSplitProgress(splitDir, inputSize, tracker)
 	splitResult, err := mrf.SplitFile(dlResult.FilePath, splitDir)
 	stopProgress()
+	splitMu.Unlock()
+
 	if err != nil {
 		result.Err = fmt.Errorf("split: %w", err)
 		return result
