@@ -44,10 +44,10 @@ def _cli_arg(name, default, type_fn=str):
     return default
 
 
-_MEMORY = _cli_arg("memory", 8192   , int)
-_CPU = _cli_arg("cpu", 4, int)
-_WORKERS = 4
-_SHARDS = 20
+_MEMORY = _cli_arg("memory", 4096   , int)
+_CPU = _cli_arg("cpu", 2, int)
+_WORKERS = 2
+_SHARDS = 40
 
 _TIMEOUT = _cli_arg("timeout", 3600, int)
 _CLOUD = _cli_arg("cloud", "aws")

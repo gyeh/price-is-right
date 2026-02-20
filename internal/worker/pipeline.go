@@ -16,6 +16,11 @@ import (
 	"github.com/gyeh/npi-rates/internal/progress"
 )
 
+// splitMu limits concurrent jsplit operations to 1. jsplit's ParseObject uses a
+// global, non-thread-safe buffer (parseObjBuffer) and can hold hundreds of MB per
+// object in memory. Serializing splits avoids both the race and memory blow-up.
+var splitMu sync.Mutex
+
 // PipelineResult holds results from processing a single MRF file.
 type PipelineResult struct {
 	URL     string
@@ -132,6 +137,13 @@ func runPipelineWithFIFO(
 	}
 	defer os.Remove(fifoPath)
 
+	// Acquire split lock — only one jsplit at a time (see splitMu comment).
+	// For FIFO mode, the download and split are coupled, so hold the lock
+	// for the entire download+split duration.
+	tracker.SetStage("Waiting for split slot")
+	splitMu.Lock()
+	defer splitMu.Unlock()
+
 	stage := "Downloading + Splitting"
 	if useStdGzip {
 		stage += " (std gzip)"
@@ -223,10 +235,16 @@ func runPipelineWithFile(
 	// Get decompressed file size for split progress tracking
 	inputSize := fileSize(dlResult.FilePath)
 
+	// Acquire split lock — only one jsplit at a time (see splitMu comment).
+	tracker.SetStage("Waiting for split slot")
+	splitMu.Lock()
+
 	tracker.SetStage("Splitting")
 	stopProgress := pollSplitProgress(splitDir, inputSize, tracker)
 	splitResult, err := mrf.SplitFile(dlResult.FilePath, splitDir)
 	stopProgress()
+	splitMu.Unlock()
+
 	if err != nil {
 		result.Err = fmt.Errorf("split: %w", err)
 		return result
