@@ -46,8 +46,39 @@ func RunPipeline(
 	targetNPIs map[int64]struct{},
 	tmpDir string,
 	noFIFO bool,
+	stream bool,
 	tracker progress.Tracker,
 ) *PipelineResult {
+	// Streaming mode: skip all disk operations, pipe HTTP → gzip → parser directly.
+	if stream {
+		var lastErr error
+		for attempt := 1; attempt <= maxPipelineRetries; attempt++ {
+			if ctx.Err() != nil {
+				return &PipelineResult{URL: url, Err: ctx.Err()}
+			}
+			useStdGzip := attempt > 1
+			result := runPipelineStreaming(ctx, url, targetNPIs, useStdGzip, tracker)
+			if result.Err == nil {
+				return result
+			}
+			lastErr = result.Err
+			if ctx.Err() != nil {
+				return result
+			}
+			if attempt < maxPipelineRetries {
+				tracker.LogWarning(fmt.Sprintf("Attempt %d/%d failed: %v", attempt, maxPipelineRetries, lastErr))
+				delay := time.Duration(attempt) * 2 * time.Second
+				tracker.SetStage(fmt.Sprintf("Retry %d/%d (waiting %s)", attempt+1, maxPipelineRetries, delay))
+				select {
+				case <-time.After(delay):
+				case <-ctx.Done():
+					return &PipelineResult{URL: url, Err: ctx.Err()}
+				}
+			}
+		}
+		return &PipelineResult{URL: url, Err: lastErr}
+	}
+
 	// Check if FIFOs are supported (they aren't on all platforms)
 	fifoSupported := false
 	if !noFIFO {

@@ -56,6 +56,7 @@ func newSearchCmd() *cobra.Command {
 		noProgress   bool
 		logProgress  bool
 		noFIFO       bool
+		streamMode   bool
 
 		// Cloud mode flags (orchestrator)
 		cloudMode   bool
@@ -207,12 +208,15 @@ func newSearchCmd() *cobra.Command {
 				return fmt.Errorf("creating temp dir: %w", err)
 			}
 
-			// Check available disk space and warn if low
-			avail := availableDiskSpace(tmpDir)
-			if avail > 0 && avail < 50*1024*1024*1024 { // < 50 GB
-				fmt.Fprintf(os.Stderr, "WARNING: Only %s available in temp dir %s\n", humanBytesCLI(avail), tmpDir)
-				fmt.Fprintf(os.Stderr, "  MRF files decompress to 5-40 GB each. Use --tmp-dir to point to a larger volume.\n")
-				fmt.Fprintf(os.Stderr, "  Consider --workers 1 to reduce concurrent disk usage.\n\n")
+			// Check available disk space and warn if low (skip for streaming mode — no disk used)
+			var avail uint64
+			if !streamMode {
+				avail = availableDiskSpace(tmpDir)
+				if avail > 0 && avail < 50*1024*1024*1024 { // < 50 GB
+					fmt.Fprintf(os.Stderr, "WARNING: Only %s available in temp dir %s\n", humanBytesCLI(avail), tmpDir)
+					fmt.Fprintf(os.Stderr, "  MRF files decompress to 5-40 GB each. Use --tmp-dir to point to a larger volume.\n")
+					fmt.Fprintf(os.Stderr, "  Consider --workers 1 to reduce concurrent disk usage.\n\n")
+				}
 			}
 
 			// Set up progress
@@ -228,7 +232,11 @@ func newSearchCmd() *cobra.Command {
 			// Log URL and environment info
 			logURLInfo(ctx, urls)
 			fmt.Fprintf(os.Stderr, "Parser: %s\n", mrf.ParserName())
-			fmt.Fprintf(os.Stderr, "Temp dir: %s (%s available)\n", tmpDir, humanBytesCLI(avail))
+			if streamMode {
+				fmt.Fprintf(os.Stderr, "Mode: streaming (no disk)\n")
+			} else {
+				fmt.Fprintf(os.Stderr, "Temp dir: %s (%s available)\n", tmpDir, humanBytesCLI(avail))
+			}
 			fmt.Fprintf(os.Stderr, "Workers: %d\n\n", workers)
 
 			// Run the worker pool
@@ -240,6 +248,7 @@ func newSearchCmd() *cobra.Command {
 				TmpDir:     tmpDir,
 				Progress:   mgr,
 				NoFIFO:     noFIFO,
+				Stream:     streamMode,
 			}
 
 			results := pool.Run(ctx, urls)
@@ -322,6 +331,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress bars")
 	cmd.Flags().BoolVar(&logProgress, "log-progress", false, "Use line-based progress logging (for non-TTY environments)")
 	cmd.Flags().BoolVar(&noFIFO, "no-fifo", false, "Use file-based pipeline instead of FIFO streaming")
+	cmd.Flags().BoolVar(&streamMode, "stream", false, "Stream directly from download to parsing (no disk, constant memory)")
 
 	// Cloud mode flags (orchestrator)
 	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Fargate)")

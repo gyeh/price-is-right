@@ -46,8 +46,8 @@ def _cli_arg(name, default, type_fn=str):
 
 _MEMORY = _cli_arg("memory", 4096   , int)
 _CPU = _cli_arg("cpu", 2, int)
-_WORKERS = 2
-_SHARDS = 40
+_WORKERS = 1
+_SHARDS = 100
 
 _TIMEOUT = _cli_arg("timeout", 3600, int)
 _CLOUD = _cli_arg("cloud", "aws")
@@ -98,7 +98,7 @@ def run_search(shard_index: int, urls: list[str], npi: str, workers: int):
             "--urls-file", urls_path,
             "--workers", str(workers),
             "--log-progress",
-            "--no-fifo",
+            "--stream",
             "--tmp-dir", tmp_dir,
             "-o", output_path,
         ],
