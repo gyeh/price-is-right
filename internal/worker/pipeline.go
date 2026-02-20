@@ -40,12 +40,16 @@ func RunPipeline(
 	url string,
 	targetNPIs map[int64]struct{},
 	tmpDir string,
+	noFIFO bool,
 	tracker progress.Tracker,
 ) *PipelineResult {
 	// Check if FIFOs are supported (they aren't on all platforms)
-	testFifo := filepath.Join(tmpDir, fmt.Sprintf("fifo-probe-%d.fifo", os.Getpid()))
-	fifoSupported := syscall.Mkfifo(testFifo, 0o600) == nil
-	os.Remove(testFifo)
+	fifoSupported := false
+	if !noFIFO {
+		testFifo := filepath.Join(tmpDir, fmt.Sprintf("fifo-probe-%d.fifo", os.Getpid()))
+		fifoSupported = syscall.Mkfifo(testFifo, 0o600) == nil
+		os.Remove(testFifo)
+	}
 
 	var lastErr error
 	for attempt := 1; attempt <= maxPipelineRetries; attempt++ {
@@ -53,7 +57,7 @@ func RunPipeline(
 			return &PipelineResult{URL: url, Err: ctx.Err()}
 		}
 
-		// Final attempt or no FIFO support: use file-based pipeline (more resilient)
+		// Final attempt, no FIFO support, or --no-fifo: use file-based pipeline (more resilient)
 		useFile := !fifoSupported || attempt == maxPipelineRetries
 
 		splitDir, err := os.MkdirTemp(tmpDir, "split-*")

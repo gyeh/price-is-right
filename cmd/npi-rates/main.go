@@ -34,6 +34,8 @@ func main() {
 	}
 
 	rootCmd.AddCommand(newSearchCmd())
+	rootCmd.AddCommand(newDownloadCmd())
+	rootCmd.AddCommand(newSplitCmd())
 	rootCmd.AddCommand(newCloudSetupCmd())
 
 	if err := rootCmd.Execute(); err != nil {
@@ -53,6 +55,7 @@ func newSearchCmd() *cobra.Command {
 		tmpDir       string
 		noProgress   bool
 		logProgress  bool
+		noFIFO       bool
 
 		// Cloud mode flags (orchestrator)
 		cloudMode   bool
@@ -236,6 +239,7 @@ func newSearchCmd() *cobra.Command {
 				TargetNPIs: npiSet,
 				TmpDir:     tmpDir,
 				Progress:   mgr,
+				NoFIFO:     noFIFO,
 			}
 
 			results := pool.Run(ctx, urls)
@@ -317,6 +321,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().StringVar(&tmpDir, "tmp-dir", "", "Temp directory for intermediate files (default: system temp)")
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress bars")
 	cmd.Flags().BoolVar(&logProgress, "log-progress", false, "Use line-based progress logging (for non-TTY environments)")
+	cmd.Flags().BoolVar(&noFIFO, "no-fifo", false, "Use file-based pipeline instead of FIFO streaming")
 
 	// Cloud mode flags (orchestrator)
 	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Fargate)")
@@ -354,6 +359,129 @@ func parseNPIs(s string) ([]int64, error) {
 		npis = append(npis, n)
 	}
 	return npis, nil
+}
+
+func newDownloadCmd() *cobra.Command {
+	var (
+		outputPath string
+		tmpDir     string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "download <url>",
+		Short: "Download and decompress a single MRF file",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			url := args[0]
+			filename := worker.FileNameFromURL(url)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sigCh := make(chan os.Signal, 2)
+			signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+			go func() {
+				<-sigCh
+				cancel()
+				<-sigCh
+				os.Exit(1)
+			}()
+
+			if tmpDir == "" {
+				tmpDir = "."
+			}
+
+			fmt.Fprintf(os.Stderr, "Downloading %s ...\n", filename)
+			startTime := time.Now()
+
+			result, err := worker.DownloadAndDecompress(ctx, url, tmpDir, func(downloaded, total int64) {
+				// periodic progress is printed below
+			})
+			if err != nil {
+				return fmt.Errorf("download failed: %w", err)
+			}
+
+			// Move temp file to the final output path
+			dest := outputPath
+			if dest == "" {
+				// Strip .gz suffix for the default name
+				dest = strings.TrimSuffix(filename, ".gz")
+			}
+			if err := os.Rename(result.FilePath, dest); err != nil {
+				// Rename failed (cross-device), fall back to keeping temp file
+				dest = result.FilePath
+			}
+
+			elapsed := time.Since(startTime).Truncate(time.Second)
+			info, _ := os.Stat(dest)
+			decompressedSize := int64(0)
+			if info != nil {
+				decompressedSize = info.Size()
+			}
+
+			fmt.Fprintf(os.Stderr, "Downloaded and decompressed in %s\n", elapsed)
+			if result.TotalBytes > 0 {
+				fmt.Fprintf(os.Stderr, "  Compressed:   %s\n", humanBytesCLI(uint64(result.TotalBytes)))
+			}
+			if decompressedSize > 0 {
+				fmt.Fprintf(os.Stderr, "  Decompressed: %s\n", humanBytesCLI(uint64(decompressedSize)))
+			}
+			fmt.Fprintf(os.Stderr, "  Output: %s\n", dest)
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&outputPath, "output", "o", "", "Output file path (default: filename without .gz)")
+	cmd.Flags().StringVar(&tmpDir, "tmp-dir", "", "Temp directory for intermediate files (default: current dir)")
+
+	return cmd
+}
+
+func newSplitCmd() *cobra.Command {
+	var outputDir string
+
+	cmd := &cobra.Command{
+		Use:   "split <file>",
+		Short: "Split a decompressed MRF JSON file into NDJSON chunks",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			inputPath := args[0]
+
+			// Verify the input file exists
+			info, err := os.Stat(inputPath)
+			if err != nil {
+				return fmt.Errorf("cannot read input file: %w", err)
+			}
+
+			if outputDir == "" {
+				outputDir = strings.TrimSuffix(inputPath, ".json") + "_split"
+			}
+			if err := os.MkdirAll(outputDir, 0o755); err != nil {
+				return fmt.Errorf("creating output dir: %w", err)
+			}
+
+			fmt.Fprintf(os.Stderr, "Splitting %s (%s) ...\n", inputPath, humanBytesCLI(uint64(info.Size())))
+			startTime := time.Now()
+
+			result, err := mrf.SplitFile(inputPath, outputDir)
+			if err != nil {
+				return fmt.Errorf("split failed: %w", err)
+			}
+
+			elapsed := time.Since(startTime).Truncate(time.Second)
+
+			fmt.Fprintf(os.Stderr, "Split complete in %s\n", elapsed)
+			fmt.Fprintf(os.Stderr, "  Output dir: %s\n", outputDir)
+			fmt.Fprintf(os.Stderr, "  provider_references: %d file(s)\n", len(result.ProviderReferenceFiles))
+			fmt.Fprintf(os.Stderr, "  in_network:          %d file(s)\n", len(result.InNetworkFiles))
+
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVarP(&outputDir, "output-dir", "o", "", "Output directory for split files (default: <input>_split)")
+
+	return cmd
 }
 
 func newCloudSetupCmd() *cobra.Command {

@@ -13,6 +13,7 @@ type Pool struct {
 	TargetNPIs map[int64]struct{}
 	TmpDir     string
 	Progress   progress.Manager
+	NoFIFO     bool
 }
 
 // Run processes all URLs concurrently and returns all results.
@@ -44,7 +45,7 @@ func (p *Pool) Run(ctx context.Context, urls []string) []PipelineResult {
 			defer func() { <-sem }()
 
 			tracker := p.Progress.NewTracker(idx, len(urls), FileNameFromURL(u))
-			result := RunPipeline(ctx, u, p.TargetNPIs, p.TmpDir, tracker)
+			result := RunPipeline(ctx, u, p.TargetNPIs, p.TmpDir, p.NoFIFO, tracker)
 			results[idx] = *result
 			tracker.Done()
 		}(i, url)
