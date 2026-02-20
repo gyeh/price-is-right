@@ -1,0 +1,1 @@
+https://antm-pt-prod-dataz-nogbd-nophi-us-east1.s3.amazonaws.com/anthem/CA_BCCSMED0500.json.gz
