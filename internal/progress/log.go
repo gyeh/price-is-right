@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -13,7 +12,6 @@ import (
 // non-TTY environments (e.g. Modal, Fargate, CI). Prints periodic
 // status lines instead of interactive progress bars.
 type LogManager struct {
-	mu        sync.Mutex
 	diskStop  chan struct{}
 	completed int32
 	totalURLs int32
@@ -58,8 +56,6 @@ func (m *LogManager) StartDiskMonitor(tmpDir string) {}
 func (m *LogManager) StopDiskMonitor() {}
 
 func (m *LogManager) log(msg string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	ts := time.Now().Format("15:04:05")
 	fmt.Fprintf(os.Stderr, "%s %s\n", ts, msg)
 }
@@ -83,8 +79,6 @@ const (
 )
 
 func (t *logTracker) log(msg string) {
-	t.mgr.mu.Lock()
-	defer t.mgr.mu.Unlock()
 	ts := time.Now().Format("15:04:05")
 	prefix := ""
 	if t.mgr.taskID != "" {

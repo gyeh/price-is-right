@@ -65,11 +65,14 @@ func RunPipeline(
 			return &PipelineResult{URL: url, Err: fmt.Errorf("creating split dir: %w", err)}
 		}
 
+		// Use standard gzip (single-threaded, more reliable) on retries
+		useStdGzip := attempt > 1
+
 		var result *PipelineResult
 		if useFile {
-			result = runPipelineWithFile(ctx, url, targetNPIs, tmpDir, splitDir, tracker)
+			result = runPipelineWithFile(ctx, url, targetNPIs, tmpDir, splitDir, useStdGzip, tracker)
 		} else {
-			result = runPipelineWithFIFO(ctx, url, targetNPIs, tmpDir, splitDir, tracker)
+			result = runPipelineWithFIFO(ctx, url, targetNPIs, tmpDir, splitDir, useStdGzip, tracker)
 		}
 
 		if result.Err == nil {
@@ -117,6 +120,7 @@ func runPipelineWithFIFO(
 	targetNPIs map[int64]struct{},
 	tmpDir string,
 	splitDir string,
+	useStdGzip bool,
 	tracker progress.Tracker,
 ) *PipelineResult {
 	result := &PipelineResult{URL: url}
@@ -128,10 +132,14 @@ func runPipelineWithFIFO(
 	}
 	defer os.Remove(fifoPath)
 
-	tracker.SetStage("Downloading + Splitting")
+	stage := "Downloading + Splitting"
+	if useStdGzip {
+		stage += " (std gzip)"
+	}
+	tracker.SetStage(stage)
 	dlErrCh := make(chan error, 1)
 	go func() {
-		dlErrCh <- StreamDecompressToPath(ctx, url, fifoPath, func(downloaded, total int64) {
+		dlErrCh <- StreamDecompressToPath(ctx, url, fifoPath, useStdGzip, func(downloaded, total int64) {
 			tracker.SetProgress(downloaded, total)
 		})
 	}()
@@ -193,12 +201,17 @@ func runPipelineWithFile(
 	targetNPIs map[int64]struct{},
 	tmpDir string,
 	splitDir string,
+	useStdGzip bool,
 	tracker progress.Tracker,
 ) *PipelineResult {
 	result := &PipelineResult{URL: url}
 
-	tracker.SetStage("Downloading")
-	dlResult, err := DownloadAndDecompress(ctx, url, tmpDir, func(downloaded, total int64) {
+	stage := "Downloading"
+	if useStdGzip {
+		stage += " (std gzip)"
+	}
+	tracker.SetStage(stage)
+	dlResult, err := DownloadAndDecompress(ctx, url, tmpDir, useStdGzip, func(downloaded, total int64) {
 		tracker.SetProgress(downloaded, total)
 	})
 	if err != nil {

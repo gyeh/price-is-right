@@ -393,7 +393,7 @@ func newDownloadCmd() *cobra.Command {
 			fmt.Fprintf(os.Stderr, "Downloading %s ...\n", filename)
 			startTime := time.Now()
 
-			result, err := worker.DownloadAndDecompress(ctx, url, tmpDir, func(downloaded, total int64) {
+			result, err := worker.DownloadAndDecompress(ctx, url, tmpDir, false, func(downloaded, total int64) {
 				// periodic progress is printed below
 			})
 			if err != nil {

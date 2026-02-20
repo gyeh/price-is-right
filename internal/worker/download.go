@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -66,9 +67,21 @@ func downloadHTTP(ctx context.Context, url string) (*http.Response, error) {
 	return nil, fmt.Errorf("download failed after retries: %w", err)
 }
 
-// DownloadAndDecompress downloads a gzipped URL, decompresses with pgzip, and writes to a temp file.
+// newGzipReader creates a gzip decompression reader. When useStdGzip is true,
+// it uses the standard library's single-threaded compress/gzip (more reliable).
+// Otherwise it uses pgzip (parallel, faster, but can produce mid-stream corruption
+// on very large files).
+func newGzipReader(r io.Reader, useStdGzip bool) (io.ReadCloser, error) {
+	if useStdGzip {
+		return gzip.NewReader(r)
+	}
+	return pgzip.NewReader(r)
+}
+
+// DownloadAndDecompress downloads a gzipped URL, decompresses, and writes to a temp file.
+// When useStdGzip is true, uses standard compress/gzip instead of pgzip for more reliable decompression.
 // onProgress is called with (bytesDownloaded, totalBytes) during download.
-func DownloadAndDecompress(ctx context.Context, url string, tmpDir string, onProgress func(downloaded, total int64)) (*DownloadResult, error) {
+func DownloadAndDecompress(ctx context.Context, url string, tmpDir string, useStdGzip bool, onProgress func(downloaded, total int64)) (*DownloadResult, error) {
 	resp, err := downloadHTTP(ctx, url)
 	if err != nil {
 		return nil, err
@@ -87,10 +100,13 @@ func DownloadAndDecompress(ctx context.Context, url string, tmpDir string, onPro
 		}
 	}
 
-	// Decompress with pgzip
-	gzReader, err := pgzip.NewReader(reader)
+	// Count compressed bytes actually read
+	countReader := &countingReader{reader: reader}
+
+	// Decompress
+	gzReader, err := newGzipReader(countReader, useStdGzip)
 	if err != nil {
-		return nil, fmt.Errorf("pgzip reader: %w", err)
+		return nil, fmt.Errorf("gzip reader: %w", err)
 	}
 	defer gzReader.Close()
 
@@ -109,16 +125,29 @@ func DownloadAndDecompress(ctx context.Context, url string, tmpDir string, onPro
 		return nil, fmt.Errorf("writing decompressed data: %w", err)
 	}
 
+	// Verify the full compressed payload was received
+	if totalBytes > 0 && countReader.n != totalBytes {
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("download truncated: got %d of %d compressed bytes", countReader.n, totalBytes)
+	}
+
+	// Verify decompressed JSON is structurally intact (starts with '{', ends with '}')
+	if err := verifyJSONBrackets(tmpFile.Name()); err != nil {
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("decompression corrupt: %w", err)
+	}
+
 	return &DownloadResult{
 		FilePath:   tmpFile.Name(),
 		TotalBytes: totalBytes,
 	}, nil
 }
 
-// StreamDecompressToPath downloads a gzipped URL, decompresses with pgzip, and writes
+// StreamDecompressToPath downloads a gzipped URL, decompresses, and writes
 // to the specified path. The path can be a regular file or a FIFO (named pipe).
+// When useStdGzip is true, uses standard compress/gzip instead of pgzip.
 // For FIFOs, this blocks on open until a reader opens the other end.
-func StreamDecompressToPath(ctx context.Context, url string, destPath string, onProgress func(downloaded, total int64)) error {
+func StreamDecompressToPath(ctx context.Context, url string, destPath string, useStdGzip bool, onProgress func(downloaded, total int64)) error {
 	resp, err := downloadHTTP(ctx, url)
 	if err != nil {
 		return err
@@ -136,9 +165,11 @@ func StreamDecompressToPath(ctx context.Context, url string, destPath string, on
 		}
 	}
 
-	gzReader, err := pgzip.NewReader(reader)
+	countReader := &countingReader{reader: reader}
+
+	gzReader, err := newGzipReader(countReader, useStdGzip)
 	if err != nil {
-		return fmt.Errorf("pgzip reader: %w", err)
+		return fmt.Errorf("gzip reader: %w", err)
 	}
 	defer gzReader.Close()
 
@@ -153,7 +184,65 @@ func StreamDecompressToPath(ctx context.Context, url string, destPath string, on
 		return fmt.Errorf("writing decompressed data: %w", err)
 	}
 
+	// Verify the full compressed payload was received
+	if totalBytes > 0 && countReader.n != totalBytes {
+		return fmt.Errorf("download truncated: got %d of %d compressed bytes", countReader.n, totalBytes)
+	}
+
 	return nil
+}
+
+// verifyJSONBrackets checks that a file starts with '{' and ends with '}'.
+// This is a cheap integrity check for MRF JSON files (always top-level objects)
+// that catches truncation and mid-stream decompression corruption without
+// reading the entire file.
+func verifyJSONBrackets(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Check first non-whitespace byte is '{'
+	var buf [1]byte
+	for {
+		if _, err := f.Read(buf[:]); err != nil {
+			return fmt.Errorf("empty or unreadable file")
+		}
+		if buf[0] != ' ' && buf[0] != '\t' && buf[0] != '\n' && buf[0] != '\r' {
+			break
+		}
+	}
+	if buf[0] != '{' {
+		return fmt.Errorf("file does not start with '{' (got %q)", string(buf[:]))
+	}
+
+	// Check last non-whitespace byte is '}'
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	// Read the last 32 bytes to find the closing brace (may have trailing whitespace/newlines)
+	tailSize := int64(32)
+	if info.Size() < tailSize {
+		tailSize = info.Size()
+	}
+	tail := make([]byte, tailSize)
+	if _, err := f.ReadAt(tail, info.Size()-tailSize); err != nil {
+		return err
+	}
+	// Scan backwards for last non-whitespace byte
+	for i := len(tail) - 1; i >= 0; i-- {
+		b := tail[i]
+		if b == ' ' || b == '\t' || b == '\n' || b == '\r' {
+			continue
+		}
+		if b == '}' {
+			return nil
+		}
+		return fmt.Errorf("file does not end with '}' (last non-whitespace byte: %q)", string([]byte{b}))
+	}
+	return fmt.Errorf("file tail is all whitespace")
 }
 
 // FileNameFromURL extracts a human-readable filename from a URL.
@@ -169,6 +258,17 @@ func FileNameFromURL(url string) string {
 		}
 	}
 	return filepath.Base(path)
+}
+
+type countingReader struct {
+	reader io.Reader
+	n      int64
+}
+
+func (cr *countingReader) Read(p []byte) (int, error) {
+	n, err := cr.reader.Read(p)
+	cr.n += int64(n)
+	return n, err
 }
 
 type progressReader struct {

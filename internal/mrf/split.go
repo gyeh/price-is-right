@@ -6,13 +6,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 
 	"github.com/danielchalef/jsplit/pkg/jsplit"
 )
-
-// stdoutMu protects os.Stdout swaps during jsplit calls.
-var stdoutMu sync.Mutex
 
 // SplitResult holds the paths to the NDJSON files produced by jsplit.
 type SplitResult struct {
@@ -24,19 +20,7 @@ type SplitResult struct {
 // SplitFile splits a JSON file (optionally gzipped) into NDJSON files using jsplit.
 // Returns the paths to the provider_references and in_network NDJSON files.
 func SplitFile(inputPath, outputDir string) (*SplitResult, error) {
-	// Suppress jsplit's stdout prints (mutex-protected for concurrent calls)
-	stdoutMu.Lock()
-	origStdout := os.Stdout
-	devNull, err := os.Open(os.DevNull)
-	if err != nil {
-		stdoutMu.Unlock()
-		return nil, fmt.Errorf("failed to open /dev/null: %w", err)
-	}
-	os.Stdout = devNull
-	err = jsplit.Split(inputPath, outputDir, true)
-	os.Stdout = origStdout
-	devNull.Close()
-	stdoutMu.Unlock()
+	err := jsplit.Split(inputPath, outputDir, true)
 	if err != nil {
 		return nil, fmt.Errorf("jsplit split failed: %w", err)
 	}

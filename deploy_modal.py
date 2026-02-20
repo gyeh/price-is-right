@@ -6,8 +6,10 @@ Usage:
     modal run deploy_modal.py --npi 1770671182 --urls-file ny_urls.txt
 """
 
+import atexit
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -42,12 +44,15 @@ def _cli_arg(name, default, type_fn=str):
     return default
 
 
-_CPU = _cli_arg("cpu", 2, int)
-_MEMORY = _cli_arg("memory", 4096   , int)
+_MEMORY = _cli_arg("memory", 8192   , int)
+_CPU = _cli_arg("cpu", 4, int)
+_WORKERS = 4
+_SHARDS = 20
+
 _TIMEOUT = _cli_arg("timeout", 3600, int)
 _CLOUD = _cli_arg("cloud", "aws")
 _REGION = _cli_arg("region", "us-east-1")
-_VOLUME_NAME = _cli_arg("volume-name", "npi-rates-data")
+_VOLUME_NAME = f"npi-rates-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 # ---------------------------------------------------------------------------
 # Modal app setup
@@ -167,11 +172,16 @@ def merge_results(shard_outputs: list[bytes]) -> dict:
 def main(
     npi: str,
     urls_file: str = None,
-    shards: int = 40,
-    workers: int = 0
+    shards: int = _SHARDS,
+    workers: int = _WORKERS
 ):
     if workers == 0:
         workers = _CPU
+
+    # Ensure volume cleanup runs on exit, Ctrl+C, or SIGTERM
+    atexit.register(cleanup_volume, _VOLUME_NAME)
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(1))
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 
     urls = read_urls(urls_file)
     url_shards = shard_urls(urls, shards)
@@ -189,7 +199,6 @@ def main(
         ))
     except Exception as e:
         log(f"Search failed: {e}")
-        cleanup_volume(_VOLUME_NAME)
         sys.exit(1)
 
     wall_time = time.time() - start
@@ -207,6 +216,4 @@ def main(
     matched = merged["search_params"]["matched_files"]
     log(f"Search complete: {searched} files searched, {matched} matched, {count} rates found in {wall_time:.1f}s")
     log(f"Results saved to {output_path}")
-
-    cleanup_volume(_VOLUME_NAME)
     log("Function run completed")
