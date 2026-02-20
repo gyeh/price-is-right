@@ -3,7 +3,9 @@ package progress
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,21 +13,38 @@ import (
 // non-TTY environments (e.g. Modal, Fargate, CI). Prints periodic
 // status lines instead of interactive progress bars.
 type LogManager struct {
-	mu       sync.Mutex
-	diskStop chan struct{}
+	mu        sync.Mutex
+	diskStop  chan struct{}
+	completed int32
+	totalURLs int32
+	taskID    string
 }
 
 // NewLogManager creates a new log-based progress manager.
 func NewLogManager() *LogManager {
-	return &LogManager{}
+	taskID := os.Getenv("MODAL_TASK_ID")
+	if taskID == "" {
+		// Fallback: hostname (useful for Fargate/other cloud environments)
+		taskID, _ = os.Hostname()
+	}
+	// Truncate to last 8 chars for readability
+	if len(taskID) > 8 {
+		taskID = taskID[len(taskID)-8:]
+	}
+	return &LogManager{taskID: taskID}
 }
 
 func (m *LogManager) NewTracker(index, total int, filename string) Tracker {
+	atomic.StoreInt32(&m.totalURLs, int32(total))
+	name := strings.TrimSuffix(filename, ".json.gz")
+	if len(name) > logNameWidth {
+		name = "..." + name[len(name)-(logNameWidth-3):]
+	}
 	return &logTracker{
 		mgr:   m,
 		index: index,
 		total: total,
-		name:  filename,
+		name:  fmt.Sprintf("%-*s", logNameWidth, name),
 		start: time.Now(),
 	}
 }
@@ -58,13 +77,20 @@ type logTracker struct {
 	prevTime  time.Time
 }
 
-const logInterval = 20 * time.Second
+const (
+	logInterval  = 20 * time.Second
+	logNameWidth = 40
+)
 
 func (t *logTracker) log(msg string) {
 	t.mgr.mu.Lock()
 	defer t.mgr.mu.Unlock()
 	ts := time.Now().Format("15:04:05")
-	fmt.Fprintf(os.Stderr, "%s [%d/%d] %s  %s\n", ts, t.index+1, t.total, t.name, msg)
+	prefix := ""
+	if t.mgr.taskID != "" {
+		prefix = fmt.Sprintf("[ID|%s] ", t.mgr.taskID)
+	}
+	fmt.Fprintf(os.Stderr, "%s %s[URL|%d/%d] [%s]  %s\n", ts, prefix, t.mgr.completed, t.total, t.name, msg)
 }
 
 func (t *logTracker) SetStage(stage string) {
@@ -115,6 +141,8 @@ func (t *logTracker) LogWarning(msg string) {
 }
 
 func (t *logTracker) Done() {
+	done := atomic.AddInt32(&t.mgr.completed, 1)
+	total := atomic.LoadInt32(&t.mgr.totalURLs)
 	elapsed := time.Since(t.start).Truncate(time.Second)
-	t.log(fmt.Sprintf("Finished in %s", elapsed))
+	t.log(fmt.Sprintf("Finished in %s  [%d/%d URLs complete]", elapsed, done, total))
 }

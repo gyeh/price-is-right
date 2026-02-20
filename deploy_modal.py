@@ -3,7 +3,7 @@
 Deploy npi-rates to Modal, shard URLs across parallel workers, merge results.
 
 Usage:
-    modal run deploy_modal.py
+    modal run deploy_modal.py --npi 1770671182 --urls-file ny_urls.txt
 """
 
 import json
@@ -14,10 +14,32 @@ from datetime import datetime
 
 import modal
 
-VOLUME_NAME = "npi-rates-data"
-NUM_SHARDS = 20
-NPI = "1770671182"
 
+# ---------------------------------------------------------------------------
+# Module-level CLI parsing for params that must be known at decorator time.
+# Modal's @app.function decorator evaluates at import, before main() runs,
+# so we extract infra params from sys.argv early.
+# ---------------------------------------------------------------------------
+def _cli_arg(name, default, type_fn=str):
+    flag = f"--{name}"
+    for i, arg in enumerate(sys.argv):
+        if arg == flag and i + 1 < len(sys.argv):
+            return type_fn(sys.argv[i + 1])
+        if arg.startswith(f"{flag}="):
+            return type_fn(arg.split("=", 1)[1])
+    return default
+
+
+_CPU = _cli_arg("cpu", 4, int)
+_MEMORY = _cli_arg("memory", 8192   , int)
+_TIMEOUT = _cli_arg("timeout", 3600, int)
+_CLOUD = _cli_arg("cloud", "aws")
+_REGION = _cli_arg("region", "us-east-1")
+_VOLUME_NAME = _cli_arg("volume-name", "npi-rates-data")
+
+# ---------------------------------------------------------------------------
+# Modal app setup
+# ---------------------------------------------------------------------------
 app = modal.App("npi-rates")
 
 image = (
@@ -26,28 +48,26 @@ image = (
     .dockerfile_commands(["ENTRYPOINT []"])
 )
 
-volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+volume = modal.Volume.from_name(_VOLUME_NAME, create_if_missing=True)
 
 
 @app.function(
     image=image,
-    cpu=8,
-    memory=16384,
+    cpu=_CPU,
+    memory=_MEMORY,
     volumes={"/data": volume},
-    timeout=7200,  # 2 hours
-    cloud="aws",
-    region="us-east-1"
+    timeout=_TIMEOUT,
+    cloud=_CLOUD,
+    region=_REGION,
 )
-def run_search(shard_index: int, urls: list[str]):
+def run_search(shard_index: int, urls: list[str], npi: str, workers: int):
     import os
     import subprocess as sp
-    import tempfile
 
     work_dir = f"/data/shard-{shard_index}"
     tmp_dir = os.path.join(work_dir, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
-    # Write URLs to a temp file for --urls-file
     urls_path = os.path.join(work_dir, "urls.txt")
     with open(urls_path, "w") as f:
         f.write("\n".join(urls))
@@ -57,9 +77,9 @@ def run_search(shard_index: int, urls: list[str]):
     proc = sp.run(
         [
             "/npi-rates", "search",
-            "--npi", NPI,
+            "--npi", npi,
             "--urls-file", urls_path,
-            "--workers", "8",
+            "--workers", str(workers),
             "--log-progress",
             "--no-fifo",
             "--tmp-dir", tmp_dir,
@@ -74,11 +94,11 @@ def run_search(shard_index: int, urls: list[str]):
         return f.read()
 
 
-def cleanup_volume():
+def cleanup_volume(name: str):
     """Delete the remote Modal volume."""
     print("Cleaning up remote volume...")
     subprocess.run(
-        [sys.executable, "-m", "modal", "volume", "delete", VOLUME_NAME, "--yes"],
+        [sys.executable, "-m", "modal", "volume", "delete", name, "--yes"],
         capture_output=True,
     )
 
@@ -99,7 +119,7 @@ def shard_urls(urls: list[str], n: int) -> list[list[str]]:
     shards: list[list[str]] = [[] for _ in range(n)]
     for i, url in enumerate(urls):
         shards[i % n].append(url)
-    return [s for s in shards if s]  # drop empty shards
+    return [s for s in shards if s]
 
 
 def merge_results(shard_outputs: list[bytes]) -> dict:
@@ -132,30 +152,40 @@ def merge_results(shard_outputs: list[bytes]) -> dict:
 
 
 @app.local_entrypoint()
-def main(urls_file: str = "ny_urls.txt"):
-    urls = read_urls(urls_file)
-    shards = shard_urls(urls, NUM_SHARDS)
+def main(
+    npi: str,
+    urls_file: str = None,
+    shards: int = 40,
+    workers: int = 0
+):
+    if workers == 0:
+        workers = _CPU
 
-    print(f"Deploying npi-rates to Modal ({len(urls)} URLs across {len(shards)} shards, 8 CPU / 16GB each)...")
+    urls = read_urls(urls_file)
+    url_shards = shard_urls(urls, shards)
+
+    print(f"NPI: {npi}")
+    print(f"Files: {len(urls)} URLs across {len(url_shards)} shards")
+    print(f"Infra: {_CPU} CPU, {_MEMORY} MB memory, {_CLOUD}/{_REGION}")
+    print(f"Workers per shard: {workers}")
+    print()
+
     start = time.time()
 
     try:
-        # Launch all shards in parallel via Modal's .map()
         shard_outputs = list(run_search.starmap(
-            [(i, shard) for i, shard in enumerate(shards)]
+            [(i, shard, npi, workers) for i, shard in enumerate(url_shards)]
         ))
     except Exception as e:
         print(f"\nSearch failed: {e}", file=sys.stderr)
-        cleanup_volume()
+        cleanup_volume(_VOLUME_NAME)
         sys.exit(1)
 
     wall_time = time.time() - start
 
-    # Merge all shard results
     merged = merge_results(shard_outputs)
     merged["search_params"]["duration_seconds"] = wall_time
 
-    # Save locally with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"results_{timestamp}.json"
     with open(output_path, "w") as f:
@@ -167,6 +197,5 @@ def main(urls_file: str = "ny_urls.txt"):
     print(f"\nSearch complete: {searched} files searched, {matched} matched, {count} rates found in {wall_time:.1f}s")
     print(f"Results saved to {output_path}")
 
-    # Tear down remote volume
-    cleanup_volume()
+    cleanup_volume(volume_name)
     print("Done.")
