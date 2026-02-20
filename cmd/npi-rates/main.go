@@ -52,6 +52,7 @@ func newSearchCmd() *cobra.Command {
 		workers      int
 		tmpDir       string
 		noProgress   bool
+		logProgress  bool
 
 		// Cloud mode flags (orchestrator)
 		cloudMode   bool
@@ -213,7 +214,9 @@ func newSearchCmd() *cobra.Command {
 
 			// Set up progress
 			var mgr progress.Manager
-			if noProgress {
+			if logProgress {
+				mgr = progress.NewLogManager()
+			} else if noProgress {
 				mgr = &progress.NoopManager{}
 			} else {
 				mgr = progress.NewMPBManager()
@@ -313,6 +316,7 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().IntVar(&workers, "workers", 3, "Number of concurrent file workers")
 	cmd.Flags().StringVar(&tmpDir, "tmp-dir", "", "Temp directory for intermediate files (default: system temp)")
 	cmd.Flags().BoolVar(&noProgress, "no-progress", false, "Disable progress bars")
+	cmd.Flags().BoolVar(&logProgress, "log-progress", false, "Use line-based progress logging (for non-TTY environments)")
 
 	// Cloud mode flags (orchestrator)
 	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Fargate)")
