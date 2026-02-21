@@ -1,189 +1,102 @@
-// Package modal implements distributed MRF search orchestration using deployed Modal functions.
-// It shards URLs across parallel function calls, collects results, and merges them locally.
+// Package modal implements distributed MRF search orchestration via `modal run`.
+// It shells out to `modal run deploy_modal.py` which handles sharding, spawning
+// parallel workers, merging results, and streaming logs to stderr.
 package modal
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"sync"
-	"sync/atomic"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
-
-	modalsdk "github.com/modal-labs/libmodal/modal-go"
-
-	"github.com/gyeh/npi-rates/internal/mrf"
-	"github.com/gyeh/npi-rates/internal/output"
 )
 
 // Config holds configuration for a Modal-based distributed search.
 type Config struct {
 	NPI             string
-	URLs            []string
+	URLsFile        string   // path to URLs file (already exists on disk)
+	URLs            []string // if set, written to temp file
 	OutputFile      string
 	Shards          int
 	WorkersPerShard int
 }
 
-type shardResult struct {
-	index int
-	data  []byte
-	err   error
-}
-
-// RunSearch executes a distributed search using deployed Modal functions.
+// RunSearch executes a distributed search by shelling out to `modal run deploy_modal.py`.
 func RunSearch(ctx context.Context, cfg Config) error {
-	shards := shardURLs(cfg.URLs, cfg.Shards)
+	// Resolve URLs file: use existing file or write URLs to a temp file
+	urlsFile := cfg.URLsFile
+	if urlsFile == "" && len(cfg.URLs) > 0 {
+		f, err := os.CreateTemp("", "npi-urls-*.txt")
+		if err != nil {
+			return fmt.Errorf("creating temp urls file: %w", err)
+		}
+		urlsFile = f.Name()
+		defer os.Remove(urlsFile)
 
-	logf("NPI: %s", cfg.NPI)
-	logf("Files: %d URLs across %d shards", len(cfg.URLs), len(shards))
-	logf("Workers per shard: %d", cfg.WorkersPerShard)
-
-	// Create Modal client
-	client, err := modalsdk.NewClient()
-	if err != nil {
-		return fmt.Errorf("creating Modal client: %w", err)
+		if _, err := f.WriteString(strings.Join(cfg.URLs, "\n")); err != nil {
+			f.Close()
+			return fmt.Errorf("writing temp urls file: %w", err)
+		}
+		f.Close()
 	}
-	defer client.Close()
-
-	// Look up the deployed function and app
-	fn, err := client.Functions.FromName(ctx, "npi-rates", "run_search", nil)
-	if err != nil {
-		return fmt.Errorf("looking up function: %w", err)
+	if urlsFile == "" {
+		return fmt.Errorf("no URLs provided: set URLsFile or URLs")
 	}
 
-	// Spawn all shards
-	logf("Spawning %d shards...", len(shards))
+	// Locate deploy_modal.py relative to the project root.
+	// We look for it in the working directory first, then walk up.
+	scriptPath, err := findScript("deploy_modal.py")
+	if err != nil {
+		return err
+	}
+
+	args := []string{
+		"run", scriptPath,
+		"--npi", cfg.NPI,
+		"--urls-file", urlsFile,
+		"--shards", strconv.Itoa(cfg.Shards),
+		"--workers", strconv.Itoa(cfg.WorkersPerShard),
+	}
+	if cfg.OutputFile != "" {
+		args = append(args, "--output", cfg.OutputFile)
+	}
+
+	logf("Running: modal %s", strings.Join(args, " "))
 	start := time.Now()
 
-	calls := make([]*modalsdk.FunctionCall, len(shards))
-	for i, urls := range shards {
-		fc, err := fn.Spawn(ctx, []any{i, urls, cfg.NPI, cfg.WorkersPerShard}, nil)
-		if err != nil {
-			return fmt.Errorf("spawning shard %d: %w", i, err)
-		}
-		calls[i] = fc
+	cmd := exec.CommandContext(ctx, "modal", args...)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("modal run failed: %w", err)
 	}
 
-	// Collect results concurrently
-	var completedCount atomic.Int32
-	results := make([]shardResult, len(shards))
-	var wg sync.WaitGroup
-	for i, fc := range calls {
-		wg.Add(1)
-		go func(idx int, fc *modalsdk.FunctionCall) {
-			defer wg.Done()
-			result, err := fc.Get(ctx, nil)
-			if err != nil {
-				results[idx] = shardResult{index: idx, err: fmt.Errorf("shard %d: %w", idx, err)}
-				n := completedCount.Add(1)
-				logf("Shard %d/%d complete (error)", n, len(shards))
-				return
-			}
-			data, ok := result.([]byte)
-			if !ok {
-				results[idx] = shardResult{index: idx, err: fmt.Errorf("shard %d: unexpected result type %T", idx, result)}
-				n := completedCount.Add(1)
-				logf("Shard %d/%d complete (error)", n, len(shards))
-				return
-			}
-			results[idx] = shardResult{index: idx, data: data}
-			n := completedCount.Add(1)
-			logf("Shard %d/%d complete", n, len(shards))
-		}(i, fc)
-	}
-
-	wg.Wait()
-	wallTime := time.Since(start)
-
-	// Collect successful results
-	var successData [][]byte
-	var failCount int
-	for _, r := range results {
-		if r.err != nil {
-			logf("Shard %d failed: %v", r.index, r.err)
-			failCount++
-			continue
-		}
-		successData = append(successData, r.data)
-	}
-
-	if len(successData) == 0 {
-		return fmt.Errorf("all %d shards failed", len(results))
-	}
-
-	merged, err := mergeResults(successData)
-	if err != nil {
-		return fmt.Errorf("merging results: %w", err)
-	}
-	merged.SearchParams.DurationSeconds = wallTime.Seconds()
-
-	if err := output.WriteResults(cfg.OutputFile, merged.SearchParams, merged.Results); err != nil {
-		return fmt.Errorf("writing output: %w", err)
-	}
-
-	logf("Search complete: %d files searched, %d matched, %d rates found in %.1fs",
-		merged.SearchParams.SearchedFiles,
-		merged.SearchParams.MatchedFiles,
-		len(merged.Results),
-		wallTime.Seconds(),
-	)
-	if failCount > 0 {
-		logf("Warning: %d/%d shards failed", failCount, len(results))
-	}
-	logf("Results saved to %s", cfg.OutputFile)
-
+	logf("modal run completed in %.1fs", time.Since(start).Seconds())
 	return nil
 }
 
-func shardURLs(urls []string, n int) [][]string {
-	if n <= 0 {
-		n = 1
+// findScript walks up from the working directory looking for the given script file.
+func findScript(name string) (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("getting working directory: %w", err)
 	}
-	if n > len(urls) {
-		n = len(urls)
-	}
-	shards := make([][]string, n)
-	for i, url := range urls {
-		shards[i%n] = append(shards[i%n], url)
-	}
-	var result [][]string
-	for _, s := range shards {
-		if len(s) > 0 {
-			result = append(result, s)
+	for {
+		candidate := filepath.Join(dir, name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
 		}
-	}
-	return result
-}
-
-func mergeResults(outputs [][]byte) (*mrf.SearchOutput, error) {
-	var merged mrf.SearchOutput
-	first := true
-
-	for i, data := range outputs {
-		var out mrf.SearchOutput
-		if err := json.Unmarshal(data, &out); err != nil {
-			logf("Warning: skipping shard output %d (%d bytes): %v", i, len(data), err)
-			continue
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
 		}
-		if first {
-			merged.SearchParams.NPIs = out.SearchParams.NPIs
-			first = false
-		}
-		merged.SearchParams.SearchedFiles += out.SearchParams.SearchedFiles
-		merged.SearchParams.MatchedFiles += out.SearchParams.MatchedFiles
-		if out.SearchParams.DurationSeconds > merged.SearchParams.DurationSeconds {
-			merged.SearchParams.DurationSeconds = out.SearchParams.DurationSeconds
-		}
-		merged.Results = append(merged.Results, out.Results...)
+		dir = parent
 	}
-
-	if merged.Results == nil {
-		merged.Results = []mrf.RateResult{}
-	}
-
-	return &merged, nil
+	return "", fmt.Errorf("%s not found in working directory or any parent", name)
 }
 
 func logf(format string, args ...any) {

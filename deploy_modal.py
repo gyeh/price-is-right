@@ -158,7 +158,8 @@ def main(
     npi: str,
     urls_file: str = None,
     shards: int = _SHARDS,
-    workers: int = _WORKERS
+    workers: int = _WORKERS,
+    output: str = "",
 ):
     if workers == 0:
         workers = _CPU
@@ -186,8 +187,11 @@ def main(
     merged = merge_results(shard_outputs)
     merged["search_params"]["duration_seconds"] = wall_time
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"results_{timestamp}.json"
+    if output:
+        output_path = output
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = f"results_{timestamp}.json"
     with open(output_path, "w") as f:
         json.dump(merged, f, indent=2)
 

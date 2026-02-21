@@ -145,7 +145,8 @@ func newSearchCmd() *cobra.Command {
 
 				return modalorch.RunSearch(ctx, modalorch.Config{
 					NPI:             strings.Join(npiStrs, ","),
-					URLs:            urls,
+					URLsFile:        urlsFile,
+					URLs:            urlsList,
 					OutputFile:      outputFile,
 					Shards:          shards,
 					WorkersPerShard: cloudWorkers,
