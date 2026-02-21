@@ -217,8 +217,7 @@ func newSearchCmd() *cobra.Command {
 			matchedFiles := 0
 			for _, r := range results {
 				if r.Err != nil {
-					fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", worker.FileNameFromURL(r.URL), r.Err)
-					continue
+					return fmt.Errorf("fatal: error processing %s: %w", worker.FileNameFromURL(r.URL), r.Err)
 				}
 				if len(r.Results) > 0 {
 					matchedFiles++
