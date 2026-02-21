@@ -59,15 +59,9 @@ func newSearchCmd() *cobra.Command {
 		noSimd       bool
 
 		// Cloud mode flags (Modal orchestration)
-		cloudMode     bool
-		shards        int
-		cloudCPU      float64
-		cloudMemory   int
-		cloudTimeout  time.Duration
-		cloudProvider string
-		region        string
-		cloudImage    string
-		cloudWorkers  int
+		cloudMode    bool
+		shards       int
+		cloudWorkers int
 	)
 
 	cmd := &cobra.Command{
@@ -142,7 +136,7 @@ func newSearchCmd() *cobra.Command {
 			}
 			logURLInfo(ctx, urls)
 
-			// --- Cloud mode: distribute to Modal sandboxes ---
+			// --- Cloud mode: distribute to Modal functions ---
 			if cloudMode {
 				npiStrs := make([]string, len(npis))
 				for i, n := range npis {
@@ -155,13 +149,6 @@ func newSearchCmd() *cobra.Command {
 					OutputFile:      outputFile,
 					Shards:          shards,
 					WorkersPerShard: cloudWorkers,
-					CPU:             cloudCPU,
-					MemoryMiB:       cloudMemory,
-					Timeout:         cloudTimeout,
-					Cloud:           cloudProvider,
-					Region:          region,
-					Image:           cloudImage,
-					Progress:        !noProgress && isTerminal(),
 				})
 			}
 
@@ -200,7 +187,7 @@ func newSearchCmd() *cobra.Command {
 				mgr = progress.NewMPBManager()
 			}
 
-			// Log URL and environment info
+			// Log environment info
 			fmt.Fprintf(os.Stderr, "Parser: %s\n", mrf.ParserName())
 			if streamMode {
 				fmt.Fprintf(os.Stderr, "Mode: streaming (no disk)\n")
@@ -276,14 +263,8 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noSimd, "no-simd", false, "Disable simdjson and use stdlib encoding/json")
 
 	// Cloud mode flags (Modal orchestration)
-	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Modal sandboxes)")
+	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Modal functions)")
 	cmd.Flags().IntVar(&shards, "shards", 100, "Number of URL shards (cloud mode)")
-	cmd.Flags().Float64Var(&cloudCPU, "cloud-cpu", 2.0, "CPU cores per sandbox (cloud mode)")
-	cmd.Flags().IntVar(&cloudMemory, "cloud-memory", 4096, "Memory MB per sandbox (cloud mode)")
-	cmd.Flags().DurationVar(&cloudTimeout, "cloud-timeout", time.Hour, "Timeout per sandbox (cloud mode)")
-	cmd.Flags().StringVar(&cloudProvider, "cloud-provider", "aws", "Cloud provider for sandboxes: aws, gcp (cloud mode)")
-	cmd.Flags().StringVar(&region, "region", "us-east-1", "Region for sandboxes (cloud mode)")
-	cmd.Flags().StringVar(&cloudImage, "cloud-image", "", "Pre-built Docker image, skip cross-compile (cloud mode)")
 	cmd.Flags().IntVar(&cloudWorkers, "cloud-workers", 1, "Workers per shard (cloud mode)")
 
 	return cmd

@@ -74,7 +74,7 @@ type logTracker struct {
 }
 
 const (
-	logInterval  = 10 * time.Second
+	logInterval  = 20 * time.Second
 	logNameWidth = 40
 )
 

@@ -1,4 +1,4 @@
-# npi-rates
+# The Price is Right
 
 Search payer Machine-Readable Files (MRFs) for negotiated procedure rates by provider NPI number.
 
@@ -75,27 +75,29 @@ This queries the [NPPES NPI Registry](https://npiregistry.cms.hhs.gov/), shows m
 
 ### Cloud mode (Modal)
 
-For large URL lists (100+ files), distribute across parallel [Modal](https://modal.com) sandboxes:
+For large URL lists (100+ files), distribute across parallel [Modal](https://modal.com) functions:
 
 ```bash
+# One-time setup: deploy the function to Modal
+modal deploy deploy_modal.py
+
+# Search using deployed functions
 npi-rates search --npi 1234567890 --urls-file urls.txt --cloud --shards 50
 ```
 
-This cross-compiles the binary for Linux, uploads it to a Modal sandbox image, shards the URL list across 50 parallel sandboxes, and merges results locally. Each sandbox runs an independent `npi-rates search` instance.
+This shards the URL list across 50 parallel Modal function calls and merges results locally. Each function call runs an independent `npi-rates search` instance. The image is built once at deploy time, so subsequent searches start instantly.
 
 ```bash
-# Customize sandbox resources
+# Adjust workers per shard
 npi-rates search --npi 1234567890 --urls-file urls.txt \
-  --cloud \
-  --shards 100 \
-  --cloud-cpu 4 \
-  --cloud-memory 8192 \
-  --cloud-provider gcp \
-  --region us-central1
+  --cloud --shards 100 --cloud-workers 2
+```
 
-# Use a pre-built image (skip cross-compile)
-npi-rates search --npi 1234567890 --urls-file urls.txt \
-  --cloud --cloud-image my-registry/npi-rates:latest
+Infrastructure settings (CPU, memory, cloud provider, region) are configured in `deploy_modal.py` and applied at deploy time. Re-deploy after changing them:
+
+```bash
+# Edit deploy_modal.py to change _CPU, _MEMORY, _CLOUD, _REGION, etc.
+modal deploy deploy_modal.py
 ```
 
 ### Other commands
@@ -166,13 +168,12 @@ On CPUs with AVX2 and CLMUL support, npi-rates uses [simdjson-go](https://github
 
 Cloud mode uses [Modal](https://modal.com) to run searches in parallel:
 
-1. Cross-compiles the `npi-rates` binary for `linux/amd64`
-2. Builds a minimal Alpine container image with the binary baked in
-3. Shards URLs round-robin across N sandboxes
-4. Each sandbox receives its URL shard, runs `npi-rates search` independently
-5. Results are read back from each sandbox and merged locally
+1. A Modal function is deployed once via `modal deploy deploy_modal.py` (builds the container image with the `npi-rates` binary)
+2. At search time, URLs are sharded round-robin across N function calls
+3. Each function call receives its URL shard and runs `npi-rates search` independently
+4. Results are returned directly and merged locally
 
-With 100 shards, a 400+ file search that would take hours locally finishes in minutes. Progress bars show per-shard status when running from a terminal.
+With 100 shards, a 400+ file search that would take hours locally finishes in minutes. A progress bar shows shard completion when running from a terminal.
 
 ## Where to get MRF URLs
 
@@ -211,7 +212,7 @@ Individual files range from hundreds of megabytes to 10+ GB compressed. The stre
 - **Provider reference resolution**: If `in_network` appears before `provider_references` in a file (non-standard but occurs), only inline `provider_groups` are matched. Rates referenced by `provider_group_id` require `provider_references` to appear first.
 - **Signed URLs**: Some insurers use time-limited signed URLs (CloudFront, S3). These expire, so URL lists may need to be regenerated before each search.
 - **Rate deduplication**: Results are emitted as-is from the MRF files. The same rate may appear in multiple files or with different negotiation arrangements.
-- **Cloud mode requires Modal account**: The `--cloud` flag requires a [Modal](https://modal.com) account and API token configured locally.
+- **Cloud mode requires Modal account**: The `--cloud` flag requires a [Modal](https://modal.com) account, API token configured locally, and a one-time `modal deploy deploy_modal.py`.
 
 ## References
 

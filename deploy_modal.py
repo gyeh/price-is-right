@@ -3,14 +3,12 @@
 Deploy npi-rates to Modal, shard URLs across parallel workers, merge results.
 
 Usage:
+    modal deploy deploy_modal.py           # one-time deploy
     modal run deploy_modal.py --npi 1770671182 --urls-file ny_urls.txt
 """
 
-import atexit
 import json
 import os
-import signal
-import subprocess
 import sys
 import time
 from datetime import datetime
@@ -44,7 +42,7 @@ def _cli_arg(name, default, type_fn=str):
     return default
 
 
-_MEMORY = _cli_arg("memory", 4096   , int)
+_MEMORY = _cli_arg("memory", 4096, int)
 _CPU = _cli_arg("cpu", 2, int)
 _WORKERS = 1
 _SHARDS = 100
@@ -52,7 +50,6 @@ _SHARDS = 100
 _TIMEOUT = _cli_arg("timeout", 3600, int)
 _CLOUD = _cli_arg("cloud", "aws")
 _REGION = _cli_arg("region", "us-east-1")
-_VOLUME_NAME = f"npi-rates-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
 # ---------------------------------------------------------------------------
 # Modal app setup
@@ -65,14 +62,11 @@ image = (
     .dockerfile_commands(["ENTRYPOINT []"])
 )
 
-volume = modal.Volume.from_name(_VOLUME_NAME, create_if_missing=True)
-
 
 @app.function(
     image=image,
     cpu=_CPU,
     memory=_MEMORY,
-    volumes={"/data": volume},
     timeout=_TIMEOUT,
     cloud=_CLOUD,
     region=_REGION,
@@ -81,7 +75,7 @@ def run_search(shard_index: int, urls: list[str], npi: str, workers: int):
     import os
     import subprocess as sp
 
-    work_dir = f"/data/shard-{shard_index}"
+    work_dir = f"/tmp/shard-{shard_index}"
     tmp_dir = os.path.join(work_dir, "tmp")
     os.makedirs(tmp_dir, exist_ok=True)
 
@@ -109,15 +103,6 @@ def run_search(shard_index: int, urls: list[str], npi: str, workers: int):
 
     with open(output_path, "rb") as f:
         return f.read()
-
-
-def cleanup_volume(name: str):
-    """Delete the remote Modal volume."""
-    log("Cleaning up remote volume...")
-    subprocess.run(
-        [sys.executable, "-m", "modal", "volume", "delete", name, "--yes"],
-        capture_output=True,
-    )
 
 
 def read_urls(path: str) -> list[str]:
@@ -177,11 +162,6 @@ def main(
 ):
     if workers == 0:
         workers = _CPU
-
-    # Ensure volume cleanup runs on exit, Ctrl+C, or SIGTERM
-    atexit.register(cleanup_volume, _VOLUME_NAME)
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(1))
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(1))
 
     urls = read_urls(urls_file)
     url_shards = shard_urls(urls, shards)
