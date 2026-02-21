@@ -10,12 +10,19 @@ import (
 	simdjson "github.com/minio/simdjson-go"
 )
 
+// StreamResult is the return value from StreamParse, indicating whether a
+// second pass is needed (when in_network appeared before provider_references).
+type StreamResult struct {
+	NeedSecondPass   bool
+	MatchedProviders *MatchedProviders
+}
+
 // StreamCallbacks holds all callbacks for StreamParse progress reporting.
 type StreamCallbacks struct {
-	OnRefScanned  func()              // called for each provider_references element
-	OnCodeScanned func()              // called for each in_network element
-	OnStageChange func(stage string)  // called when transitioning between phases
-	OnWarning     func(msg string)    // called for non-fatal issues
+	OnRefScanned  func()             // called for each provider_references element
+	OnCodeScanned func()             // called for each in_network element
+	OnStageChange func(stage string) // called when transitioning between phases
+	OnWarning     func(msg string)   // called for non-fatal issues
 }
 
 // StreamParse walks a top-level MRF JSON object from r using a streaming
@@ -24,73 +31,117 @@ type StreamCallbacks struct {
 //
 // Expected structure: { "provider_references": [...], "in_network": [...], ... }
 //
-// If in_network appears before provider_references (rare), it is processed
-// with empty MatchedProviders (only inline provider_groups will match).
+// If in_network appears before provider_references (rare), it is skipped on
+// the first pass and the caller is signaled via StreamResult.NeedSecondPass to
+// re-download and re-parse with the prebuilt MatchedProviders.
+//
+// If prebuilt is non-nil (second pass), provider_references is skipped and
+// in_network is processed using the prebuilt index.
 func StreamParse(
 	r io.Reader,
 	targetNPIs map[int64]struct{},
 	sourceFile string,
 	cb StreamCallbacks,
 	emit func(RateResult),
-) error {
+	prebuilt *MatchedProviders,
+) (*StreamResult, error) {
 	dec := json.NewDecoder(r)
 
 	// Expect opening '{' of the top-level object.
 	tok, err := dec.Token()
 	if err != nil {
-		return fmt.Errorf("reading opening token: %w", err)
+		return nil, fmt.Errorf("reading opening token: %w", err)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
-		return fmt.Errorf("expected '{', got %v", tok)
+		return nil, fmt.Errorf("expected '{', got %v", tok)
 	}
 
-	matched := &MatchedProviders{
-		ByGroupID: make(map[float64][]ProviderInfo),
+	// On second pass, use the prebuilt index directly.
+	var matched *MatchedProviders
+	if prebuilt != nil {
+		matched = prebuilt
+	} else {
+		matched = &MatchedProviders{
+			ByGroupID: make(map[float64][]ProviderInfo),
+		}
 	}
 	patterns := npiBytePatterns(targetNPIs)
 
 	var pj *simdjson.ParsedJson // reused across simdjson.Parse calls
 
 	seenProviderRefs := false
+	skippedInNetwork := false
+	var refsCount int64
 
 	for dec.More() {
 		// Read the key name.
 		tok, err = dec.Token()
 		if err != nil {
-			return fmt.Errorf("reading key: %w", err)
+			return nil, fmt.Errorf("reading key: %w", err)
 		}
 		key, ok := tok.(string)
 		if !ok {
-			return fmt.Errorf("expected string key, got %T", tok)
+			return nil, fmt.Errorf("expected string key, got %T", tok)
 		}
 
 		switch key {
 		case "provider_references":
+			if prebuilt != nil {
+				// Second pass: skip provider_references, already indexed.
+				if err := skipValue(dec); err != nil {
+					return nil, fmt.Errorf("skipping provider_references (second pass): %w", err)
+				}
+				continue
+			}
 			seenProviderRefs = true
 			if cb.OnStageChange != nil {
 				cb.OnStageChange("Streaming: provider_references")
 			}
-			pj, err = streamProviderReferences(dec, targetNPIs, patterns, matched, pj, cb.OnRefScanned)
+			countingOnRef := func() {
+				refsCount++
+				if cb.OnRefScanned != nil {
+					cb.OnRefScanned()
+				}
+			}
+			pj, err = streamProviderReferences(dec, targetNPIs, patterns, matched, pj, countingOnRef)
 			if err != nil {
-				return fmt.Errorf("streaming provider_references: %w", err)
+				return nil, fmt.Errorf("streaming provider_references: %w", err)
 			}
 
 		case "in_network":
-			if !seenProviderRefs && cb.OnWarning != nil {
-				cb.OnWarning("in_network appeared before provider_references; only inline provider_groups will match")
+			if prebuilt == nil && !seenProviderRefs {
+				// First pass, reversed order: skip in_network, process provider_references first.
+				if cb.OnWarning != nil {
+					cb.OnWarning("in_network appeared before provider_references; will require second pass")
+				}
+				skippedInNetwork = true
+				if err := skipValue(dec); err != nil {
+					return nil, fmt.Errorf("skipping in_network (reversed order): %w", err)
+				}
+				continue
+			}
+			if prebuilt == nil && seenProviderRefs && refsCount > 0 && len(matched.ByGroupID) == 0 {
+				// provider_references had entries but yielded no NPI matches; skip in_network.
+				if cb.OnStageChange != nil {
+					cb.OnStageChange("Skipping: in_network (no matching providers)")
+				}
+				if err := skipValue(dec); err != nil {
+					return nil, fmt.Errorf("skipping in_network (no matches): %w", err)
+				}
+				continue
 			}
 			if cb.OnStageChange != nil {
 				cb.OnStageChange("Streaming: in_network")
 			}
 			pj, err = streamInNetwork(dec, targetNPIs, matched, sourceFile, pj, cb.OnCodeScanned, emit)
 			if err != nil {
-				return fmt.Errorf("streaming in_network: %w", err)
+				return nil, fmt.Errorf("streaming in_network: %w", err)
 			}
 
 		default:
 			// Skip unneeded keys (reporting_entity_name, etc.)
 			if err := skipValue(dec); err != nil {
-				return fmt.Errorf("skipping key %q: %w", key, err)
+				return nil, fmt.Errorf("skipping key %q: %w", key, err)
 			}
 		}
 	}
@@ -98,13 +149,16 @@ func StreamParse(
 	// Expect closing '}'.
 	tok, err = dec.Token()
 	if err != nil {
-		return fmt.Errorf("reading closing token: %w", err)
+		return nil, fmt.Errorf("reading closing token: %w", err)
 	}
 	if delim, ok := tok.(json.Delim); !ok || delim != '}' {
-		return fmt.Errorf("expected '}', got %v", tok)
+		return nil, fmt.Errorf("expected '}', got %v", tok)
 	}
 
-	return nil
+	return &StreamResult{
+		NeedSecondPass:   skippedInNetwork && len(matched.ByGroupID) > 0,
+		MatchedProviders: matched,
+	}, nil
 }
 
 // streamProviderReferences reads the provider_references JSON array element by
@@ -127,7 +181,7 @@ func streamProviderReferences(
 	}
 
 	for dec.More() {
-		// Read one element as raw JSON.
+		// Read one element as raw JSON (byte array).
 		var raw json.RawMessage
 		if err := dec.Decode(&raw); err != nil {
 			return pj, fmt.Errorf("decoding element: %w", err)
