@@ -3,7 +3,7 @@
 #
 # Accepts the same flags as `npi-rates search`.
 #   Local mode (default): runs the Go binary.
-#   Cloud mode (--cloud):  calls `modal run deploy_modal.py`.
+#   Cloud mode (--cloud):  calls `modal run python/deploy_modal.py`.
 #
 # Usage:
 #   ./price-is-right search --npi 1770671182 --urls-file ny_urls.txt
@@ -55,7 +55,7 @@ Examples:
 EOF
 }
 
-# Locate Go binary: prefer sibling, fall back to PATH.
+# Locate Go binary: prefer sibling, fall back to PATH, build if needed.
 find_binary() {
     local bin="${SCRIPT_DIR}/npi-rates"
     if [[ -x "$bin" ]]; then
@@ -67,11 +67,21 @@ find_binary() {
         echo "$bin"
         return
     fi
-    echo "error: npi-rates binary not found. Run 'go build -o npi-rates ./cmd/npi-rates' first." >&2
-    exit 1
+    # Binary not found — try to build it.
+    if ! command -v go &>/dev/null; then
+        echo "error: npi-rates binary not found and 'go' is not installed." >&2
+        echo "Install Go (https://go.dev/dl/) or build manually: go build -o npi-rates ./cmd/npi-rates" >&2
+        exit 1
+    fi
+    echo "npi-rates binary not found, building..." >&2
+    if ! go build -o "${SCRIPT_DIR}/npi-rates" "${SCRIPT_DIR}/cmd/npi-rates"; then
+        echo "error: failed to build npi-rates" >&2
+        exit 1
+    fi
+    echo "${SCRIPT_DIR}/npi-rates"
 }
 
-MODAL_SCRIPT="${SCRIPT_DIR}/deploy_modal.py"
+MODAL_SCRIPT="${SCRIPT_DIR}/python/deploy_modal.py"
 
 # --- Handle -h / --help / help at the top level ---
 if [[ $# -eq 0 ]]; then

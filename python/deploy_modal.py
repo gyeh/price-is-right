@@ -3,8 +3,8 @@
 Deploy npi-rates to Modal, shard URLs across parallel workers, merge results.
 
 Usage:
-    modal deploy deploy_modal.py           # one-time deploy
-    modal run deploy_modal.py --npi 1770671182 --urls-file ny_urls.txt
+    modal deploy python/deploy_modal.py           # one-time deploy
+    modal run python/deploy_modal.py --npi 1770671182 --urls-file ny_urls.txt
 """
 
 import json

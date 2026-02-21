@@ -1,5 +1,5 @@
 // Package modal implements distributed MRF search orchestration via `modal run`.
-// It shells out to `modal run deploy_modal.py` which handles sharding, spawning
+// It shells out to `modal run python/deploy_modal.py` which handles sharding, spawning
 // parallel workers, merging results, and streaming logs to stderr.
 package modal
 
@@ -24,7 +24,7 @@ type Config struct {
 	WorkersPerShard int
 }
 
-// RunSearch executes a distributed search by shelling out to `modal run deploy_modal.py`.
+// RunSearch executes a distributed search by shelling out to `modal run python/deploy_modal.py`.
 func RunSearch(ctx context.Context, cfg Config) error {
 	// Resolve URLs file: use existing file or write URLs to a temp file
 	urlsFile := cfg.URLsFile
@@ -46,9 +46,9 @@ func RunSearch(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("no URLs provided: set URLsFile or URLs")
 	}
 
-	// Locate deploy_modal.py relative to the project root.
+	// Locate python/deploy_modal.py relative to the project root.
 	// We look for it in the working directory first, then walk up.
-	scriptPath, err := findScript("deploy_modal.py")
+	scriptPath, err := findScript(filepath.Join("python", "deploy_modal.py"))
 	if err != nil {
 		return err
 	}
