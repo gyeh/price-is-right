@@ -39,7 +39,29 @@ cd price_is_right
 go build -o npi-rates ./cmd/npi-rates
 ```
 
-The `price-is-right` wrapper script is the main entry point. It calls the Go binary for local searches and `modal run` for cloud searches.
+The `price-is-right` wrapper script is the main entry point. It calls the Go binary for local searches and `modal run` for cloud searches. The Go binary is built automatically on first run if not already present.
+
+### Cloud mode setup (optional)
+
+Cloud mode distributes searches across parallel containers on [Modal](https://modal.com). Skip this if you only need local search.
+
+1. **Create a Modal account** at [modal.com/signup](https://modal.com/signup) (free tier includes 30 GPU-hours/month and $30 in CPU credits).
+
+2. **Install the Modal CLI**:
+   ```bash
+   pip install modal
+   ```
+
+3. **Authenticate**:
+   ```bash
+   modal setup
+   ```
+   This opens a browser to link your account and saves credentials locally.
+
+4. **Deploy the function** (one-time, builds the container image):
+   ```bash
+   modal deploy python/deploy_modal.py
+   ```
 
 ## Usage
 
@@ -71,13 +93,9 @@ This queries the [NPPES NPI Registry](https://npiregistry.cms.hhs.gov/), shows m
 
 ### Cloud mode (Modal)
 
-For large URL lists (100+ files), distribute across parallel [Modal](https://modal.com) functions:
+For large URL lists (100+ files), distribute across parallel [Modal](https://modal.com) functions (see [Cloud mode setup](#cloud-mode-setup-optional)):
 
 ```bash
-# One-time setup: deploy the function to Modal
-modal deploy python/deploy_modal.py
-
-# Search using deployed functions
 price-is-right search --npi 1234567890 --urls-file urls.txt --cloud --shards 50
 ```
 
@@ -208,7 +226,7 @@ Individual files range from hundreds of megabytes to 10+ GB compressed. The stre
 - **Provider reference resolution**: If `in_network` appears before `provider_references` in a file (non-standard but occurs), only inline `provider_groups` are matched. Rates referenced by `provider_group_id` require `provider_references` to appear first.
 - **Signed URLs**: Some insurers use time-limited signed URLs (CloudFront, S3). These expire, so URL lists may need to be regenerated before each search.
 - **Rate deduplication**: Results are emitted as-is from the MRF files. The same rate may appear in multiple files or with different negotiation arrangements.
-- **Cloud mode requires Modal account**: The `--cloud` flag requires a [Modal](https://modal.com) account, API token configured locally, and a one-time `modal deploy python/deploy_modal.py`.
+- **Cloud mode requires Modal account**: The `--cloud` flag requires a Modal account and CLI setup. See [Cloud mode setup](#cloud-mode-setup-optional).
 
 ## References
 
