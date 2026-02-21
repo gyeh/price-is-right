@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# price-is-right — unified entry point for local and cloud MRF search.
+#
+# Accepts the same flags as `npi-rates search`.
+#   Local mode (default): runs the Go binary.
+#   Cloud mode (--cloud):  calls `modal run deploy_modal.py`.
+#
+# Usage:
+#   ./price-is-right search --npi 1770671182 --urls-file ny_urls.txt
+#   ./price-is-right search --npi 1770671182 --urls-file ny_urls.txt --cloud --shards 3
+#   ./price-is-right download <url>
+#   ./price-is-right split <file>
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+usage() {
+    cat <<'EOF'
+Search CMS Price Transparency MRF files for negotiated rates by NPI.
+
+Usage:
+  price-is-right <command> [flags]
+
+Commands:
+  search      Search MRF files for negotiated rates matching specified NPIs
+  download    Download and decompress a single MRF file
+  split       Split a decompressed MRF JSON file into NDJSON chunks
+
+Search flags:
+  --npi string             Comma-separated NPI numbers to search for
+  --provider-name string   Search by provider name ("First Last") [local only]
+  --state string           State filter for provider name search (2-letter code)
+  --urls-file string       File containing MRF URLs (one per line)
+  --url strings            MRF URL(s) to search (can be repeated or comma-separated)
+  -o, --output string      Output file path (default: results_<timestamp>.json)
+  --workers int            Number of concurrent file workers (default 3) [local only]
+  --tmp-dir string         Temp directory for intermediate files [local only]
+  --stream                 Stream directly from download to parsing (default true) [local only]
+  --no-progress            Disable progress bars [local only]
+  --log-progress           Use line-based progress logging [local only]
+  --no-fifo                Use file-based pipeline instead of FIFO [local only]
+  --no-simd                Disable simdjson parser [local only]
+
+Cloud flags:
+  --cloud                  Run in cloud mode (distribute to Modal functions)
+  --shards int             Number of URL shards (default 100)
+  --cloud-workers int      Workers per shard (default 1)
+
+Examples:
+  price-is-right search --npi 1770671182 --urls-file ny_urls.txt
+  price-is-right search --npi 1770671182 --urls-file ny_urls.txt --cloud --shards 3
+  price-is-right download <url>
+  price-is-right split <file>
+EOF
+}
+
+# Locate Go binary: prefer sibling, fall back to PATH.
+find_binary() {
+    local bin="${SCRIPT_DIR}/npi-rates"
+    if [[ -x "$bin" ]]; then
+        echo "$bin"
+        return
+    fi
+    bin="$(command -v npi-rates 2>/dev/null || true)"
+    if [[ -n "$bin" ]]; then
+        echo "$bin"
+        return
+    fi
+    echo "error: npi-rates binary not found. Run 'go build -o npi-rates ./cmd/npi-rates' first." >&2
+    exit 1
+}
+
+MODAL_SCRIPT="${SCRIPT_DIR}/deploy_modal.py"
+
+# --- Handle -h / --help / help at the top level ---
+if [[ $# -eq 0 ]]; then
+    usage
+    exit 0
+fi
+case "$1" in
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+esac
+
+# --- Quick check: is this `search --cloud`? ---
+has_cloud=false
+has_search=false
+has_help=false
+for arg in "$@"; do
+    [[ "$arg" == "search" ]] && has_search=true
+    [[ "$arg" == "--cloud" ]] && has_cloud=true
+    [[ "$arg" == "-h" || "$arg" == "--help" ]] && has_help=true
+done
+
+# Show our usage for `search --cloud --help`.
+if $has_search && $has_cloud && $has_help; then
+    usage
+    exit 0
+fi
+
+# Non-cloud or non-search: pass everything through to Go binary.
+if ! $has_search || ! $has_cloud; then
+    exec "$(find_binary)" "$@"
+fi
+
+# ---------------------------------------------------------------------------
+# Cloud search mode
+# ---------------------------------------------------------------------------
+
+# Check that `modal` CLI is installed.
+if ! command -v modal &>/dev/null; then
+    echo "error: 'modal' CLI not found." >&2
+    echo "" >&2
+    echo "Install it with:" >&2
+    echo "  pip install modal" >&2
+    echo "" >&2
+    echo "Then authenticate:" >&2
+    echo "  modal setup" >&2
+    exit 1
+fi
+
+# Extract a flag's value from an argument list.
+# Supports `--flag value` and `--flag=value` forms.
+get_flag() {
+    local flag="$1"; shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            "$flag"=*) echo "${1#*=}"; return 0 ;;
+            "$flag")
+                if [[ $# -gt 1 ]]; then echo "$2"; return 0; fi ;;
+        esac
+        shift
+    done
+    return 1
+}
+
+# Collect all --url values (repeated flags and/or comma-separated).
+collect_urls() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --url=*) echo "${1#--url=}" ;;
+            --url)   if [[ $# -gt 1 ]]; then shift; echo "$1"; fi ;;
+        esac
+        shift
+    done
+}
+
+# Build search_args: everything after the "search" subcommand.
+search_args=()
+found_search=false
+for arg in "$@"; do
+    if [[ "$arg" == "search" ]] && ! $found_search; then
+        found_search=true
+        continue
+    fi
+    search_args+=("$arg")
+done
+
+# --provider-name requires interactive NPI lookup; not supported in cloud mode.
+if get_flag --provider-name "${search_args[@]}" >/dev/null 2>&1; then
+    echo "error: --provider-name is not supported in cloud mode. Use --npi instead." >&2
+    exit 1
+fi
+
+npi="$(get_flag --npi "${search_args[@]}" || true)"
+urls_file="$(get_flag --urls-file "${search_args[@]}" || true)"
+output="$(get_flag --output "${search_args[@]}" || get_flag -o "${search_args[@]}" || true)"
+shards="$(get_flag --shards "${search_args[@]}" || echo 100)"
+cloud_workers="$(get_flag --cloud-workers "${search_args[@]}" || echo 1)"
+
+if [[ -z "$npi" ]]; then
+    echo "error: --npi is required" >&2
+    exit 1
+fi
+
+# If no --urls-file, collect --url flags and write to a temp file.
+if [[ -z "$urls_file" ]]; then
+    raw_urls=()
+    while IFS= read -r line; do
+        raw_urls+=("$line")
+    done < <(collect_urls "${search_args[@]}")
+
+    if [[ ${#raw_urls[@]} -eq 0 ]]; then
+        echo "error: either --urls-file or --url is required" >&2
+        exit 1
+    fi
+
+    # Expand comma-separated values (matches Go StringSliceVar behavior).
+    expanded_urls=()
+    for u in "${raw_urls[@]}"; do
+        IFS=',' read -ra parts <<< "$u"
+        expanded_urls+=("${parts[@]}")
+    done
+
+    tmp_urls="$(mktemp /tmp/npi-urls-XXXXXX.txt)"
+    trap 'rm -f "$tmp_urls"' EXIT
+    printf '%s\n' "${expanded_urls[@]}" > "$tmp_urls"
+    urls_file="$tmp_urls"
+fi
+
+# Build the `modal run` command.
+modal_args=(
+    run "$MODAL_SCRIPT"
+    --npi "$npi"
+    --urls-file "$urls_file"
+    --shards "$shards"
+    --workers "$cloud_workers"
+)
+if [[ -n "$output" ]]; then
+    modal_args+=(--output "$output")
+fi
+
+echo "Running: modal ${modal_args[*]}" >&2
+exec modal "${modal_args[@]}"
