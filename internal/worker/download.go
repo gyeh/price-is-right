@@ -29,9 +29,9 @@ type DownloadResult struct {
 	TotalBytes int64  // compressed size from Content-Length (or -1)
 }
 
-// downloadHTTP performs an HTTP GET with retries and returns the response.
+// DownloadHTTP performs an HTTP GET with retries and returns the response.
 // Caller is responsible for closing resp.Body.
-func downloadHTTP(ctx context.Context, url string) (*http.Response, error) {
+func DownloadHTTP(ctx context.Context, url string) (*http.Response, error) {
 	var resp *http.Response
 	var err error
 
@@ -67,11 +67,11 @@ func downloadHTTP(ctx context.Context, url string) (*http.Response, error) {
 	return nil, fmt.Errorf("download failed after retries: %w", err)
 }
 
-// newGzipReader creates a gzip decompression reader. When useStdGzip is true,
+// NewGzipReader creates a gzip decompression reader. When useStdGzip is true,
 // it uses the standard library's single-threaded compress/gzip (more reliable).
 // Otherwise it uses pgzip (parallel, faster, but can produce mid-stream corruption
 // on very large files).
-func newGzipReader(r io.Reader, useStdGzip bool) (io.ReadCloser, error) {
+func NewGzipReader(r io.Reader, useStdGzip bool) (io.ReadCloser, error) {
 	if useStdGzip {
 		return gzip.NewReader(r)
 	}
@@ -82,7 +82,7 @@ func newGzipReader(r io.Reader, useStdGzip bool) (io.ReadCloser, error) {
 // When useStdGzip is true, uses standard compress/gzip instead of pgzip for more reliable decompression.
 // onProgress is called with (bytesDownloaded, totalBytes) during download.
 func DownloadAndDecompress(ctx context.Context, url string, tmpDir string, useStdGzip bool, onProgress func(downloaded, total int64)) (*DownloadResult, error) {
-	resp, err := downloadHTTP(ctx, url)
+	resp, err := DownloadHTTP(ctx, url)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +104,7 @@ func DownloadAndDecompress(ctx context.Context, url string, tmpDir string, useSt
 	countReader := &countingReader{reader: reader}
 
 	// Decompress
-	gzReader, err := newGzipReader(countReader, useStdGzip)
+	gzReader, err := NewGzipReader(countReader, useStdGzip)
 	if err != nil {
 		return nil, fmt.Errorf("gzip reader: %w", err)
 	}
@@ -148,7 +148,7 @@ func DownloadAndDecompress(ctx context.Context, url string, tmpDir string, useSt
 // When useStdGzip is true, uses standard compress/gzip instead of pgzip.
 // For FIFOs, this blocks on open until a reader opens the other end.
 func StreamDecompressToPath(ctx context.Context, url string, destPath string, useStdGzip bool, onProgress func(downloaded, total int64)) error {
-	resp, err := downloadHTTP(ctx, url)
+	resp, err := DownloadHTTP(ctx, url)
 	if err != nil {
 		return err
 	}
@@ -167,7 +167,7 @@ func StreamDecompressToPath(ctx context.Context, url string, destPath string, us
 
 	countReader := &countingReader{reader: reader}
 
-	gzReader, err := newGzipReader(countReader, useStdGzip)
+	gzReader, err := NewGzipReader(countReader, useStdGzip)
 	if err != nil {
 		return fmt.Errorf("gzip reader: %w", err)
 	}

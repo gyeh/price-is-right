@@ -22,7 +22,7 @@ func downloadAndParse(
 	emit func(mrf.RateResult),
 	prebuilt *mrf.MatchedProviders,
 ) (*mrf.StreamResult, error) {
-	resp, err := downloadHTTP(ctx, url)
+	resp, err := DownloadHTTP(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
 	}
@@ -35,7 +35,7 @@ func downloadAndParse(
 	}
 	countReader := &countingReader{reader: progReader}
 
-	gzReader, err := newGzipReader(countReader, useStdGzip)
+	gzReader, err := NewGzipReader(countReader, useStdGzip)
 	if err != nil {
 		return nil, fmt.Errorf("gzip reader: %w", err)
 	}

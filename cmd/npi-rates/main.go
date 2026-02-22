@@ -23,6 +23,7 @@ import (
 	"github.com/gyeh/npi-rates/internal/npi"
 	"github.com/gyeh/npi-rates/internal/output"
 	"github.com/gyeh/npi-rates/internal/progress"
+	"github.com/gyeh/npi-rates/internal/toc"
 	"github.com/gyeh/npi-rates/internal/worker"
 	"github.com/spf13/cobra"
 )
@@ -57,6 +58,10 @@ func newSearchCmd() *cobra.Command {
 		noFIFO       bool
 		streamMode   bool
 		noSimd       bool
+
+		// TOC resolution flags
+		planID string
+		tocURL string
 
 		// Cloud mode flags (Modal orchestration)
 		cloudMode    bool
@@ -112,27 +117,52 @@ func newSearchCmd() *cobra.Command {
 			}
 
 			// Look up NPI provider info
-			if notFound := printProviderInfo(ctx, npis); len(notFound) > 0 {
-				if !confirmContinue(notFound) {
-					return fmt.Errorf("aborted: %d NPI(s) not found in NPPES registry", len(notFound))
+			if !logProgress {
+				if notFound := printProviderInfo(ctx, npis); len(notFound) > 0 {
+					if !confirmContinue(notFound) {
+						return fmt.Errorf("aborted: %d NPI(s) not found in NPPES registry", len(notFound))
+					}
 				}
 			}
 
-			// --- Read URLs from file or command-line ---
+			// Validate TOC flags: must be provided together.
+			if (planID != "") != (tocURL != "") {
+				return fmt.Errorf("--plan-id and --toc-url must be provided together")
+			}
+
+			// --- Gather URLs ---
 			var urls []string
+
+			// Source 1: TOC resolution
+			if tocURL != "" {
+				fmt.Fprintf(os.Stderr, "Resolving TOC for plan %s...\n", planID)
+				tocResult, tocErr := toc.FetchAndResolve(ctx, tocURL, planID, func(d, t int64) {
+					// optional progress
+				})
+				if tocErr != nil {
+					return fmt.Errorf("TOC resolution failed: %w", tocErr)
+				}
+				if len(tocResult.URLs) == 0 {
+					return fmt.Errorf("TOC resolution found 0 in-network URLs for plan %s", planID)
+				}
+				fmt.Fprintf(os.Stderr, "TOC: %d MRF URLs from %d matching structures (entity: %s)\n",
+					len(tocResult.URLs), tocResult.MatchedStructures, tocResult.ReportingEntityName)
+				urls = tocResult.URLs
+			}
+
+			// Source 2: explicit URLs (combinable with TOC)
 			if len(urlsList) > 0 {
-				urls = urlsList
+				urls = append(urls, urlsList...)
 			} else if urlsFile != "" {
-				var readErr error
-				urls, readErr = readURLs(urlsFile)
+				fileURLs, readErr := readURLs(urlsFile)
 				if readErr != nil {
 					return fmt.Errorf("reading URLs: %w", readErr)
 				}
-			} else {
-				return fmt.Errorf("either --urls-file or --url is required")
+				urls = append(urls, fileURLs...)
 			}
+
 			if len(urls) == 0 {
-				return fmt.Errorf("no URLs found")
+				return fmt.Errorf("no URLs; use --toc-url + --plan-id, --urls-file, or --url")
 			}
 			logURLInfo(ctx, urls)
 
@@ -261,6 +291,10 @@ func newSearchCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&noFIFO, "no-fifo", false, "Use file-based pipeline instead of FIFO streaming")
 	cmd.Flags().BoolVar(&streamMode, "stream", true, "Stream directly from download to parsing (no disk, constant memory)")
 	cmd.Flags().BoolVar(&noSimd, "no-simd", false, "Disable simdjson and use stdlib encoding/json")
+
+	// TOC resolution flags
+	cmd.Flags().StringVar(&planID, "plan-id", "", "Healthcare plan identifier (HIOS ID or EIN) for TOC lookup")
+	cmd.Flags().StringVar(&tocURL, "toc-url", "", "URL of CMS Table of Contents file (.json or .json.gz)")
 
 	// Cloud mode flags (Modal orchestration)
 	cmd.Flags().BoolVar(&cloudMode, "cloud", false, "Run in cloud mode (distribute to Modal functions)")

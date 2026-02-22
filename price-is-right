@@ -7,6 +7,7 @@
 #
 # Usage:
 #   ./price-is-right search --npi 1770671182 --urls-file ny_urls.txt
+#   ./price-is-right search --npi 1770671182 --toc-url https://example.com/toc.json.gz --plan-id 12345
 #   ./price-is-right search --npi 1770671182 --urls-file ny_urls.txt --cloud --shards 3
 #   ./price-is-right download <url>
 #   ./price-is-right split <file>
@@ -33,6 +34,8 @@ Search flags:
   --state string           State filter for provider name search (2-letter code)
   --urls-file string       File containing MRF URLs (one per line)
   --url strings            MRF URL(s) to search (can be repeated or comma-separated)
+  --toc-url string         URL of CMS Table of Contents file (.json or .json.gz) [local only]
+  --plan-id string         Healthcare plan identifier (HIOS ID or EIN) for TOC lookup [local only]
   -o, --output string      Output file path (default: results_<timestamp>.json)
   --workers int            Number of concurrent file workers (default 3) [local only]
   --tmp-dir string         Temp directory for intermediate files [local only]
@@ -49,6 +52,7 @@ Cloud flags:
 
 Examples:
   price-is-right search --npi 1770671182 --urls-file ny_urls.txt
+  price-is-right search --npi 1770671182 --toc-url https://example.com/toc.json.gz --plan-id 12345
   price-is-right search --npi 1770671182 --urls-file ny_urls.txt --cloud --shards 3
   price-is-right download <url>
   price-is-right split <file>
@@ -172,6 +176,14 @@ done
 # --provider-name requires interactive NPI lookup; not supported in cloud mode.
 if get_flag --provider-name "${search_args[@]}" >/dev/null 2>&1; then
     echo "error: --provider-name is not supported in cloud mode. Use --npi instead." >&2
+    exit 1
+fi
+
+# --toc-url / --plan-id resolve locally; not supported in cloud mode.
+if get_flag --toc-url "${search_args[@]}" >/dev/null 2>&1 || \
+   get_flag --plan-id "${search_args[@]}" >/dev/null 2>&1; then
+    echo "error: --toc-url and --plan-id are not supported in cloud mode." >&2
+    echo "Resolve the TOC locally first, then pass the resulting URLs via --urls-file." >&2
     exit 1
 fi
 
